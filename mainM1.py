@@ -1,179 +1,108 @@
-# test_hetero_timing.py - 异构维度 M-MoG IGO 计时测试用例 (最终修正版)
-
 import jax
 import jax.numpy as jnp
-from jax import random, vmap, jit, lax 
-import functools 
+from jax import random, vmap, jit
 import time 
-from typing import Tuple, List
 
-# 确保导入您的核心优化器文件
-# 假设 MPCsolver_Hetero.py 已经在 gmm_igo/ 目录下
-from gmm_igo.MPCsolverM2 import mmog_igo_optimizer_mpc 
+# 导入已经根据 Algorithm 3 严格修改后的求解器
+# 假设新求解器保存在 gmm_igo/MPCsolverM2.py 中
+from gmm_igo.MPCsolverM22 import mmog_igo_optimizer
 
-# --- I. 配置参数 (异构 M-MoG + T0 + Context 配置) ---
-SEED = 42
-T_RUN = 3000       # T: 循环轮数
-DELTA_T = 0.1     # 步长
-M_MOG = 3         # M: MoG 数量 (子空间数量)
-K_COMP = 8        # K: 每个 MoG 的分量数量
-DIMS_TUPLE = (2, 5, 8) # 关键: 异构维度
-B_SAMPLES = 60    # B: 整体样本数量
-B_0_ELITE = 25    # B_0: 精英样本数量
-T_0_RESTART = 500 # T_0: 周期性热重启轮数
-NUM_RUNS = 10     # 计时测试的运行次数
-D_TOTAL = sum(DIMS_TUPLE)
-D_MAX = max(DIMS_TUPLE)
-
-# --- II. 异构适应度函数 (Context 敏感) ---
-
-def create_mpc_coupled_sphere_fitness_fn_hetero(M_MOG, dims_tuple: Tuple[int, ...]):
+# ======================================================================
+# 1. 目标函数 (对齐 Algorithm 3 的最小化倾向)
+# ======================================================================
+@jit
+def multi_goal_fitness_fn(z_flattened, context):
     """
-    创建一个 Context 敏感的耦合 Sphere 函数，支持异构维度切片和填充掩码。
+    多目标点优化函数。
+    Algorithm 3 默认按 f(z) 递增排序（即最小化问题）。
     """
-    COUPLING_WEIGHT = 0.1 
-    D_MAX = max(dims_tuple)
-    D_ARRAY = jnp.array(dims_tuple)
-
-    @jax.jit
-    def fitness_fn_total(samples_overall, context):
-        """
-        samples_overall: (M * D_MAX,) - 展平后的填充样本向量
-        """
-        dynamic_target_value = context[0] 
-        
-        # 1. 结构重塑: (M * D_MAX,) -> (M, D_MAX)
-        samples_M_padded = samples_overall.reshape((M_MOG, D_MAX))
-        
-        # 2. 局部项 (Sphere Term): 使用掩码确保只计算实际维度
-        
-        def loop_body_local(m, f_sum):
-            D_m = D_ARRAY[m]
-            
-            # 使用 lax.dynamic_slice 静态切片出整行 (D_MAX 维度是静态的)
-            sample_m_padded = lax.dynamic_slice(
-                samples_M_padded, 
-                (m, 0),             
-                (1, D_MAX) 
-            )[0]
-            
-            # 创建掩码 (只保留前 D_m 个元素)
-            mask = jnp.arange(D_MAX) < D_m
-            
-            # 将填充部分的样本和目标值都归零，确保只对实际 D_m 维度求和
-            sample_m_actual = sample_m_padded * mask 
-            target_masked = dynamic_target_value * mask
-            
-            return f_sum + jnp.sum((sample_m_actual - target_masked)**2)
-
-        f_local = lax.fori_loop(0, M_MOG, loop_body_local, 0.0)
-
-        # 3. 简化耦合项
-        f_coupling_simplified = jnp.sum(samples_M_padded[:, :1] - jnp.roll(samples_M_padded[:, :1], -1, axis=0))**2
-        
-        f_total = f_local + COUPLING_WEIGHT * f_coupling_simplified
-        return f_total
-
-    return fitness_fn_total
-
-# --- III. 异构初始化函数 (保持不变) ---
-
-def initialize_params_mmog_heterogeneous(key, M: int, K: int, dims: Tuple[int, ...]):
-    """
-    初始化 M 个 MoG 的参数，每个 MoG 的维度 D_m 不同，并填充到 D_max。
-    """
-    D_max: int = max(dims)
-    initial_mu_list: List[jnp.ndarray] = []
-    initial_L_inv_list: List[jnp.ndarray] = []
-    keys = random.split(key, M)
-
-    for m in range(M):
-        D_m = dims[m]
-        key_mu, key_L = random.split(keys[m])
-        
-        mu_m_actual = random.uniform(key_mu, (K+1, D_m), minval=-3.0, maxval=3.0)
-        mu_m_padded = jnp.pad(mu_m_actual, ((0, 0), (0, D_max - D_m)), mode='constant')
-        initial_mu_list.append(mu_m_padded)
-
-        L_inv_template = jnp.eye(D_m) * 1.414 
-        L_inv_k_all = jnp.stack([L_inv_template] * (K + 1)) 
-        
-        L_inv_m_padded = jnp.pad(L_inv_k_all, ((0, 0), (0, D_max - D_m), (0, D_max - D_m)), mode='constant')
-        initial_L_inv_list.append(L_inv_m_padded)
-
-    initial_v_k = jnp.zeros((M, K))
+    D_MAX = 8 
     
-    initial_mu_k_stacked = jnp.stack(initial_mu_list)     
-    initial_L_inv_k_stacked = jnp.stack(initial_L_inv_list) 
+    # 还原各块的有效维度
+    x1 = z_flattened[0:2]
+    x2 = z_flattened[D_MAX : D_MAX+5]
+    x3 = z_flattened[2*D_MAX : 2*D_MAX+8]
+    x = jnp.concatenate([x1, x2, x3])
     
-    return initial_mu_k_stacked, initial_L_inv_k_stacked, initial_v_k, D_max
-
-# --- IV. 主程序运行逻辑 (保持不变) ---
-if __name__ == '__main__':
+    # 定义目标点
+    dist_to_0 = x**2
+    dist_to_p3 = (x - 3.0)**2
+    dist_to_m3 = (x + 3.0)**2
     
-    fitness_fn_total = create_mpc_coupled_sphere_fitness_fn_hetero(M_MOG, DIMS_TUPLE)
+    # 找到每个维度距离最近的目标点的平方距离
+    min_dist_sq = jnp.min(jnp.stack([dist_to_0, dist_to_p3, dist_to_m3]), axis=0)
+    
+    # 返回正的距离之和。根据算法第18行，值越小排名越靠前（权重越高）
+    return jnp.sum(min_dist_sq)
 
+# ======================================================================
+# 2. 循环求解主程序
+# ======================================================================
+def run_loop_test():
+    # --- 参数配置 (参考 Algorithm 3 给定的变量) ---
+    SEED = 42
+    T_RUN = 1000       # T: 迭代总步数
+    DELTA_T = 0.1     # alpha_t: 学习率/步长
+    M_MOG = 3          # N: 块数量
+    K_COMP = 10        # K: 混合分量数
+    DIMS_TUPLE = (2, 5, 8) 
+    B_SAMPLES = 60     # B: 样本大小
+    B_0_ELITE = 20     # B0: 选择的精英样本数
+    T_0_RESTART = 100  # T0: 权重重置周期
+    NUM_SOLVES = 5     
+    
+    D_MAX = max(DIMS_TUPLE)
     key = random.PRNGKey(SEED)
-    key_init, key_run = random.split(key)
-    
-    initial_mu_k, initial_L_inv_k, initial_v_k, D_max_check = initialize_params_mmog_heterogeneous(
-        key_init, M_MOG, K_COMP, DIMS_TUPLE
-    )
-    
-    print("--- 异构维度 M-MoG IGO 优化器计时测试开始 ---")
-    print(f"MoG 数量 M={M_MOG}, 维度 D={DIMS_TUPLE}, 总维度 D_TOTAL={D_TOTAL}")
-    print(f"迭代 T={T_RUN}, 周期性重启 T0={T_0_RESTART}")
-    
-    current_context = jnp.array([2.0, 0.0, 0.0, 0.0]) 
 
-    print(f"\n--- 运行 IGO 优化器主循环 (目标值由 Context 决定: {current_context[0]:.1f}) ---")
+    # --- 初始状态设置 (Algorithm 3 步骤 2) ---
+    # 初始化均值 mu
+    init_mu = random.uniform(key, (M_MOG, K_COMP, D_MAX), minval=-4.0, maxval=4.0)
+    # 初始化 Cholesky 因子 L (满足 S = LL^T)
+    # 注意：算法中使用 L_inv 进行计算以提高效率
+    init_L_inv = jnp.tile(jnp.eye(D_MAX) * jnp.sqrt(4.0), (M_MOG, K_COMP, 1, 1))
+    # 初始化权重 logits (全 0 对应均匀分布 1/K)
+    init_v = jnp.zeros((M_MOG, K_COMP)) 
     
-    total_time = 0.0
-    print(f"开始计时测试，运行 {NUM_RUNS} 次...")
+    current_context = jnp.array([0.0, 1.0]) 
 
-    for run in range(NUM_RUNS):
-        key_run, subkey = random.split(key_run)
-        
+    print(f"--- 严格遵循 Algorithm 3 开始求解 (Solves={NUM_SOLVES}) ---")
+
+    for i in range(NUM_SOLVES):
+        key, subkey = random.split(key)
         start_time = time.time()
         
-        final_mu_k, final_L_inv_k, final_pi_k_all = mmog_igo_optimizer_mpc(
-            subkey, T_RUN, DELTA_T, M_MOG, K_COMP, B_SAMPLES, B_0_ELITE, 
-            DIMS_TUPLE, 
-            T_0_RESTART, fitness_fn_total,
-            initial_mu_k, initial_L_inv_k, initial_v_k,
+        # 调用严格对齐算法的求解器
+        final_mu, final_L, final_pi = mmog_igo_optimizer(
+            key=subkey, 
+            T=T_RUN, 
+            dt=DELTA_T, 
+            M=M_MOG, 
+            K=K_COMP, 
+            B=B_SAMPLES, 
+            B0=B_0_ELITE, 
+            dims=DIMS_TUPLE, 
+            T_0=T_0_RESTART, 
+            fitness_fn_total=multi_goal_fitness_fn,
+            initial_mu_k=init_mu, 
+            initial_L_inv_k=init_L_inv, 
+            initial_v_k=init_v,
             context=current_context 
         )
         
-        final_mu_k.block_until_ready()
+        final_mu.block_until_ready()
+        elapsed = time.time() - start_time
         
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        total_time += elapsed_time
+        # 结果提取：选择权重最大的分量作为代表解
+        best_comp_indices = jnp.argmax(final_pi, axis=1) # [M]
+        
+        res_summary = []
+        for m in range(M_MOG):
+            m_best_idx = best_comp_indices[m]
+            res_summary.append(final_mu[m, m_best_idx, :DIMS_TUPLE[m]])
+        
+        print(f"第 {i+1} 次求解耗时: {elapsed:.4f}s")
+        print(f"  块1(dim=2) 结果: {res_summary[0]}")
+        print(f"  块3(dim=8) 结果样例: {res_summary[2][:3]}...")
 
-        if run == 0:
-            print(f"第一次运行耗时: {elapsed_time:.4f} 秒。")
-
-    avg_time = total_time / NUM_RUNS
-    print(f"\n--- 计时结果 ({NUM_RUNS} 次运行) ---")
-    print(f"总耗时: {total_time:.4f} 秒")
-    print(f"**平均每次运行耗时: {avg_time:.4f} 秒**")
-    
-    TARGET_VALUE = current_context[0] 
-    
-    best_comp_indices = jnp.argmax(final_pi_k_all[:, :-1], axis=1) 
-    mu_star_M_padded = final_mu_k[jnp.arange(M_MOG), best_comp_indices]
-    
-    samples_overall_best = mu_star_M_padded.flatten()
-    f_mu_star = fitness_fn_total(samples_overall_best, current_context)
-    
-    mean_error_list = []
-    for m in range(M_MOG):
-        D_m = DIMS_TUPLE[m]
-        mu_m_star_actual = mu_star_M_padded[m, :D_m] 
-        mean_error_list.append(jnp.mean(jnp.abs(mu_m_star_actual - TARGET_VALUE)))
-
-    mean_error = jnp.mean(jnp.array(mean_error_list))
-
-    print(f"\n--- 优化结果总结 ---")
-    print(f"**最终适应度 f(mu*): {f_mu_star:.6e} (理论最优值: 0.0)**")
-    print(f"**收敛精度检查: 平均误差到目标点 ({TARGET_VALUE:.1f}): {mean_error:.6e}**")
+if __name__ == "__main__":
+    run_loop_test()

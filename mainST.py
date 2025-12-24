@@ -14,7 +14,7 @@ SEED = 42
 T_RUN = 10000      # 循环轮数
 DELTA_T = 0.08     # 步长 (您的原值)
 K_COMP = 20      # 分量数量 (您的原值)
-D_DIM = 4         # 维度 (您的值)
+D_DIM = 32         # 维度 (您的值)
 B_SAMPLES = 100    # 样本数量
 B_0_ELITE = 30    # 精英样本
 T_0_RESTART = 1000 # 重置周期 ($T_0$)
@@ -26,7 +26,7 @@ def fitness_fn(x):
     Styblinski-Tang Function (D dimensions). 
     全局最优值在每个坐标 x_i ≈ -2.9035
     """
-    term = x**4 - 16.0 * x**2 + 5.0 * x + 10000* jnp.maximum(-x,0) + 10000*jnp.maximum(x-1,0)
+    term = x**4 - 16.0 * x**2 + 5.0 * x 
     return jnp.sum(term)
 
 # --- III. 初始化函数 ---

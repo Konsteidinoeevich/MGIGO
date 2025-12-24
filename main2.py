@@ -6,15 +6,19 @@ from jax import random, vmap
 import numpy as np
 import time  # <-- 新增：用于精确计时
 
+
 # 假设 solver.py 已经在同一目录下
 from gmm_igo.solver2 import igo_mog_optimizer 
 
+
+jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_debug_infs", True)
 # --- I. 配置参数 (使用当前配置) ---
 SEED = 42
-T_RUN = 1000      # 循环轮数
+T_RUN = 10      # 循环轮数
 DELTA_T = 0.1     # 步长 (使用当前值)
-K_COMP = 15       # 分量数量
-D_DIM = 15         # 维度 (高维测试)
+K_COMP = 5       # 分量数量
+D_DIM = 3         # 维度 (高维测试)
 B_SAMPLES = 60    # 样本数量 (使用当前值)
 B_0_ELITE = 25    # 精英样本 (使用当前值)
 
@@ -37,7 +41,7 @@ def initialize_params(key, K, D):
     key_mu, key_L, key_pi = random.split(key, 3)
     
     initial_mu_k = random.uniform(key_mu, (K, D), minval=-5.0, maxval=5.0)
-    L_inv_template = jnp.eye(D) * jnp.sqrt(2.0)
+    L_inv_template = jnp.eye(D) * 1.0
     L_inv_k = jnp.stack([L_inv_template] * K)
     initial_pi_k = jnp.ones(K) / K
     

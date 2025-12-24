@@ -124,7 +124,7 @@ def _get_overall_elite_weights(samples_M: jnp.ndarray, fitness_fn_total: Callabl
     
     ranks = jnp.argsort(jnp.argsort(f_xi))
     is_elite = ranks < B0
-    return jnp.where(is_elite, 1.0/B0, 0.0) 
+    return jnp.where(is_elite, 1.0/B, 0.0) 
 
 # ======================================================================
 # III. K 个分量维度感知更新逻辑 (Static Dispatch 修正)

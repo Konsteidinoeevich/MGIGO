@@ -45,7 +45,7 @@ def initialize_params_single_mog(key, K, D):
     initial_mu_k = random.uniform(key_mu, (K+1, D), minval=-5.0, maxval=5.0)
     
     # 2. 初始逆乔列斯基因子 L_inv_k: 对应信息矩阵 S = 2.0 * I
-    L_inv_template = jnp.eye(D) * jnp.sqrt(2.0)
+    L_inv_template = jnp.eye(D) * 1.5
     initial_L_inv_k = jnp.stack([L_inv_template] * (K + 1))
     
     # 3. 初始权重 pi_k: (K+1,) - 均匀权重 

@@ -5,6 +5,15 @@ import jax.numpy as jnp
 from jax import vmap, random, lax
 import functools
 
+def _nan_check(x, name):
+    jax.debug.print(
+        "[NaN CHECK] {name}: nan={nan}, inf={inf}",
+        name=name,
+        nan=jnp.any(jnp.isnan(x)),
+        inf=jnp.any(jnp.isinf(x)),
+    )
+    return x
+
 # ----------------------------------------------------------------------
 # I. 核心辅助函数 (信息矩阵 S_k 范式)
 # ----------------------------------------------------------------------
@@ -79,6 +88,10 @@ def _update_step_k_l_single_component(
 ):
     """在信息矩阵 S_k 范式下，单个分量 k 的更新函数。"""
     S_k_t = L_inv_k_t @ L_inv_k_t.T # S_k 是信息矩阵
+
+    
+    _nan_check(S_k_t, "S_k_t")
+
     D = mu_k_t.shape[0]
     
     # --- 1. Log(alpha) 和 Log(beta) (使用 L_inv) ---
@@ -95,8 +108,12 @@ def _update_step_k_l_single_component(
     
     a_i = jnp.exp(log_a_i)
     b_i = jnp.exp(log_b_i)
+
     scaled_a_i = a_i * elite_weights
-    
+
+    _nan_check(a_i, "a_i")
+    _nan_check(b_i, "b_i")
+    _nan_check(scaled_a_i, "scaled_a_i")    
     # --- 2. S_k 更新 (信息矩阵 S_k 的自然梯度) ---
     diff = samples - mu_k_t
     diff_outer = vmap(lambda x: jnp.outer(x, x))(diff)
@@ -105,10 +122,11 @@ def _update_step_k_l_single_component(
     # 协方差更新项 (Sigma_t @ diff_outer @ Sigma_t - Sigma_t)
     # 原始 IGO S_k 更新项 (恢复到您的原始理论形式)
     
-    Sigma_k_t = jnp.linalg.inv(S_k_t) # 协方差 Sigma_k = S_k^{-1}
+    Sigma_k_t = jnp.linalg.solve(S_k_t, jnp.eye(D)) # 协方差 Sigma_k = S_k^{-1}
     
 
-    
+    _nan_check(Sigma_k_t, "Sigma_k_t")
+
     # 恢复您最初的逻辑，但使用 Sigma_k = S_k^{-1}
     S_update_term_i = Sigma_k_t @ diff_outer @ Sigma_k_t - Sigma_k_t[None, :, :]
     
@@ -120,11 +138,24 @@ def _update_step_k_l_single_component(
     S_k_t_plus_1_prop = S_k_t - delta_t * sum_S_update # S_k 是信息矩阵
     
     S_k_t_plus_1_prop = (S_k_t_plus_1_prop + S_k_t_plus_1_prop.T) / 2
-    D_dim = S_k_t_plus_1_prop.shape[0]
-    S_k_t_plus_1_prop = S_k_t_plus_1_prop + jnp.eye(D_dim) * 1e-6 
+    #D_dim = S_k_t_plus_1_prop.shape[0]
+    #S_k_t_plus_1_prop = S_k_t_plus_1_prop + jnp.eye(D_dim) * 1e-6 
     
-    # 更新 L_inv
+    S_k_t_plus_1_prop = (S_k_t_plus_1_prop + S_k_t_plus_1_prop.T) / 2
+
+# Sigma = S^{-1}
+    Sigma_k_t_plus_1 = jnp.linalg.solve(S_k_t_plus_1_prop, jnp.eye(D))
+
+# 协方差正则
+    Sigma_k_t_plus_1 = Sigma_k_t_plus_1 + 1e-10 * jnp.eye(D)
+
+# 回到信息矩阵
+    S_k_t_plus_1_prop = jnp.linalg.solve(Sigma_k_t_plus_1, jnp.eye(D))
+
+# Cholesky
     L_inv_k_t_plus_1 = jnp.linalg.cholesky(S_k_t_plus_1_prop)
+    # 更新 L_inv
+  #  L_inv_k_t_plus_1 = jnp.linalg.cholesky(S_k_t_plus_1_prop)
     #S_k_t_plus_1 = L_inv_k_t_plus_1 @ L_inv_k_t_plus_1.T
 
 
@@ -137,12 +168,13 @@ def _update_step_k_l_single_component(
     S_t_weighted_diff = S_k_t @ weighted_diff
     sum_term_vector = jnp.sum(S_t_weighted_diff, axis=1) # D 维向量
 
-    sum_term_vector_for_update=jnp.linalg.solve(L_inv_k_t_plus_1, sum_term_vector)
-    mu_update_term =jnp.linalg.solve(L_inv_k_t_plus_1.T, sum_term_vector_for_update)
+   # sum_term_vector_for_update=jnp.linalg.solve(L_inv_k_t_plus_1, sum_term_vector)
+    
+   # mu_update_term =jnp.linalg.solve(L_inv_k_t_plus_1.T, sum_term_vector_for_update)
     # 2. mu\_update\_term = S_{k, t+1}^{-1} \cdot Sum
     #    使用 jnp.linalg.solve(A, b) 计算 A^{-1}b
     #    A = S_{k, t+1}, b = sum_term_vector
-   # mu_update_term = jnp.linalg.solve(S_k_t_plus_1, sum_term_vector)
+    mu_update_term = jnp.linalg.solve(S_k_t_plus_1_prop, sum_term_vector)
 
     # 3. 应用更新
     mu_k_t_plus_1 = mu_k_t + delta_t * mu_update_term
