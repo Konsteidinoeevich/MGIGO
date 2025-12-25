@@ -49,7 +49,7 @@ def run_loop_test():
     B_SAMPLES = 60     # B: 样本大小
     B_0_ELITE = 20     # B0: 选择的精英样本数
     T_0_RESTART = 100  # T0: 权重重置周期
-    NUM_SOLVES = 5     
+    NUM_SOLVES = 10     
     
     D_MAX = max(DIMS_TUPLE)
     key = random.PRNGKey(SEED)
