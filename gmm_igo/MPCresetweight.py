@@ -60,9 +60,9 @@ def _update_step_k_l_single_component(
     sum_mu = jnp.sum((elite_weights * a_i)[:, None] * grad_mu, axis=0)
     
     # 4. 精度矩阵 S 更新 (Step 28)
-    Sigma_k = jnp.linalg.inv(S_k_t + jnp.eye(D_max)*1e-6)
+    #Sigma_k = jnp.linalg.inv(S_k_t + jnp.eye(D_max)*1e-6)
     def outer_prod_update(d):
-        return Sigma_k @ jnp.outer(d, d) @ Sigma_k - Sigma_k
+        return S_k_t @ jnp.outer(d, d) @ S_k_t - S_k_t
     
     S_grads = vmap(outer_prod_update)(diff)
     sum_S = jnp.sum((elite_weights * a_i)[:, None, None] * S_grads, axis=0)

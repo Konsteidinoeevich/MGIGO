@@ -84,8 +84,8 @@ def _update_step_k_l_single_component(
     diff = samples - mu_k_t
     diff_outer = vmap(lambda x: jnp.outer(x, x))(diff)
     
-    Sigma_k_t = jnp.linalg.inv(S_k_t) 
-    S_update_term_i = Sigma_k_t @ diff_outer @ Sigma_k_t - Sigma_k_t[None, :, :]
+    #Sigma_k_t = jnp.linalg.inv(S_k_t) 
+    S_update_term_i = S_k_t @ diff_outer @ S_k_t - S_k_t[None, :, :]
     
     sum_S_update = jnp.sum(scaled_a_i[:, None, None] * S_update_term_i, axis=0)
     

@@ -51,10 +51,10 @@ def _update_component_core(
     
     # 3. 精度矩阵 S 更新 (Line 28)
     diff = (samples - mu_k)
-    Sigma_k = jnp.linalg.inv(S_k + jnp.eye(D_max) * 1e-6)
+    #Sigma_k = jnp.linalg.inv(S_k + jnp.eye(D_max) * 1e-6)
     
     def s_grad_fn(d):
-        return Sigma_k @ jnp.outer(d, d) @ Sigma_k - Sigma_k
+        return S_k @ jnp.outer(d, d) @ S_k - S_k
     
     sum_S_grad = jnp.sum((elite_weights * a_i)[:, None, None] * vmap(s_grad_fn)(diff), axis=0)
     S_new = S_k - delta_t * sum_S_grad
