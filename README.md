@@ -70,7 +70,7 @@ $$(\pi_{j,1},\dots,\pi_{j,K}) = \left(\frac{1}{K},\dots,\frac{1}{K}\right)$$
 
 For $N$ agents with individual costs $f_i(z_i,z_{-i})$, define marginal expected cost:
 
-$$m_i(z_i; \theta_{-i}) := \mathbb{E}_{z_{-i} \sim p_{\theta_{-i}}}[f_i(z_i, z_{-i})]$$
+$$m_i(z_i; \theta_{-i}) := \mathbb{E}_{z_{-i} \sim p_{\theta_{-i}} [f_i (z_i, z_{-i})]$$
 
 A randomized Nash equilibrium satisfies:
 
