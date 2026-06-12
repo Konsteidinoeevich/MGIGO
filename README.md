@@ -70,11 +70,10 @@ $$(\pi_{j,1},\dots,\pi_{j,K}) = \left(\frac{1}{K},\dots,\frac{1}{K}\right)$$
 
 For $N$ agents with individual costs $f_i(z_i,z_{-i})$, define marginal expected cost:
 
-$$m_i(z_i; \theta_{-i}) := \mathbb{E}_{z_{-i} \sim p_{\theta_{-i}} [f_i (z_i, z_{-i})]$$
 
 A randomized Nash equilibrium satisfies:
 
-$$\mathbb{E}_{z_i \sim p_{\theta_i^*}}[m_i(z_i; \theta_{-i}^*)] \leq \mathbb{E}_{z_i \sim p_{\theta_i}}[m_i(z_i; \theta_{-i}^*)], \quad \forall p_{\theta_i}$$
+$$\mathbb{E}_{z_i \sim p_{\theta_i^*}}[m_i(z_i; \theta_{-i}^*)] \leq \mathbb{E}_{z_i \sim p_{\theta_i}}[m_i(z_i; \theta_{-i}^*)] \quad \forall p_{\theta_i} \in \mathcal{P}(\mathbb{Z}_i), \quad i=1,\dots,N$$.
 
 The coupled IGO flow for each agent:
 
