@@ -8,13 +8,14 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.animation import FFMpegWriter
+from matplotlib.animation import PillowWriter
 from matplotlib.patches import Circle
 
 project_root=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
 from gmm_igo.MPCsolver import igo_mog_optimizer
+from Constraintdealer.Constran import build, Deterministic
 
 # ==============================================================================
 # 1. 配置参数
@@ -25,10 +26,10 @@ CONFIG = {
     'horizon': 12,        # 预测时域
     'dim': 2,             # 控制维度 [v, omega]
     'n_components': 4,    
-    'pop_size': 60,      
-    'elite_size': 25,     
-    'opt_steps': 250,     # 模拟优化轮次较少的情况
-    'warmup_steps': 1500, 
+    'pop_size': 100,      
+    'elite_size': 40,     
+    'opt_steps': 200,    
+    'warmup_steps': 1000, 
     
     # 物理限制
     'max_v': 2.5,         
@@ -45,43 +46,201 @@ CONFIG = {
 TOTAL_DIM = CONFIG['horizon'] * CONFIG['dim']
 
 # ==============================================================================
-# 2. Unicycle 动力学与代价函数 (保持原样，不破坏物理平衡)
+# 2. 饱和嵌套代价函数 (Auto-Scaling Saturation Nesting)
+#
+#    2-Level 严格优先级 (仿 Hybridsystemtest.py):
+#      L1 (外层): 障碍物碰撞 → 1.5 + penetration, 碰撞区内连续梯度
+#      L2 (内层): 跟踪 + 终端 + 平滑 + 控制 → 安全区内连续梯度
+#
+#    自动缩放:
+#      L1_SCALE = H * N_obs * (1.5 + safe_dist)
+#      L2_SCALE = (2H+15)*dist + ctrl_floor  (ctrl_floor 防 dist→0 时 NaN)
+#
+#    输出范围 (数学保证):
+#      L1 激活 (碰撞):  [0.768, 1.000)
+#      L2 仅 (无碰撞):  [0.000, 0.707)
+#
+#    参考: Functiontest/Hybridsystemtest.py + Hybrid_test_README.md
 # ==============================================================================
+
+@jax.jit
+def saturate(x):
+    return (x / (jnp.sqrt(1.0 + x**2)))
+
 
 @jax.jit
 def mpc_cost_fn(flat_actions, context):
     raw_actions = flat_actions.reshape((CONFIG['horizon'], CONFIG['dim']))
-    vs = jnp.tanh(3*raw_actions[:, 0]) * CONFIG['max_v']
-    ws = jnp.tanh(3*raw_actions[:, 1]) * CONFIG['max_w']
-    
+    vs = jnp.tanh(raw_actions[:, 0]) * CONFIG['max_v']
+    ws = jnp.tanh(raw_actions[:, 1]) * CONFIG['max_w']
+
     x0, y0, theta0 = context['current_state']
     target = context['target_pos']
     dt = CONFIG['dt']
-    
+
     thetas = theta0 + jnp.cumsum(ws * dt)
     thetas_prev = jnp.concatenate([jnp.array([theta0]), thetas[:-1]])
-    
+
     dx = vs * jnp.cos(thetas_prev) * dt
     dy = vs * jnp.sin(thetas_prev) * dt
-    
+
     trajectory = jnp.stack([x0 + jnp.cumsum(dx), y0 + jnp.cumsum(dy)], axis=1)
-    
+
     dist_to_target = jnp.linalg.norm(trajectory - target, axis=1)
     cost_track = jnp.sum(dist_to_target) * 2.0
-    cost_final = jnp.linalg.norm(trajectory[-1] - target) * 50.0
-    
-    obs_pos = context['obs_pos']
-    safe_dist = context['safe_distance']
-    
-    diff = trajectory[:, None, :] - obs_pos[None, :, :]
-    min_dists = jnp.min(jnp.linalg.norm(diff, axis=-1), axis=-1)
-    
-    cost_obstacle = 600.0 * jnp.sum(jnp.maximum(0.0, safe_dist - min_dists))
-    
+    cost_final = jnp.linalg.norm(trajectory[-1] - target) * 15.0
+
     cost_smooth = jnp.sum(jnp.diff(ws)**2) * 1.5 + jnp.sum(jnp.diff(vs)**2) * 0.5
     cost_v = jnp.sum(vs**2) * 1.0 + jnp.sum(ws**2) * 0.5
+
+    # L2 raw: 总运行代价 + mu 正则化 (防 mu 在 tanh 饱和区无意义膨胀)
+    mu_reg = 0.01 * (jnp.sum(raw_actions[:, 0]**2) + jnp.sum(raw_actions[:, 1]**2))
+    f_total = cost_track + cost_final + cost_v + mu_reg
+
+    # L1 raw: 障碍物碰撞 — 1.5 + penetration, 与 Hybrid 行人公式一致
+
+    obs_pos = context['obs_pos']
+    safe_dist = context['safe_distance']
+
+    diff = trajectory[:, None, :] - obs_pos[None, :, :]
+    min_dists = jnp.min(jnp.linalg.norm(diff, axis=-1), axis=-1)
+
+    penetration = safe_dist - min_dists
+    viol_obs = jnp.sum(jnp.where(penetration > 0.0, 1.5 + penetration, 0.0))
+
     
-    return cost_track + cost_final + cost_obstacle + cost_smooth + cost_v
+
+    # —— 自动缩放 (Hybrid README §4) ——
+    H = CONFIG['horizon']
+    init_pos = jnp.array([x0, y0])
+    dist_init_to_target = jnp.linalg.norm(init_pos - target)
+
+    # L1_SCALE: 单步单障碍的特征违反 = 1.5 + safe_dist
+    #   不乘 H*N_obs — 让总违反量随步数和障碍数自然累加
+    #   小擦边 (0.01m, 1步1障碍) → 归一化 ~0.44 → saturate ~0.4  (< L2 max)
+    #   持续碰撞 (3步2障碍, 0.3m)  → 归一化 ~3.2 → saturate ~0.95 (> L2 max)
+    L1_SCALE = 1.5 + safe_dist
+
+    # L2_SCALE: 零控制跟踪 + 控制代价下界 (防 dist→0 时 NaN)
+    ctrl_cost_floor = H * (CONFIG['max_v']**2 + CONFIG['max_w']**2)
+    L2_SCALE = (2.0 * H + 15.0) * dist_init_to_target + ctrl_cost_floor + 1.0
+
+    # —— 饱和嵌套 (加法模式, 非分支) ——
+    #   viol/L1_SCALE + saturate(f/L2_SCALE): L1 和 L2 始终同时生效
+    #   - 无碰撞:      res = saturate(0 + l2_sat)    纯跟踪
+    #   - 小擦边+好跟踪: res = saturate(0.44+0.1)=0.48  比"无碰+烂跟踪"好 → 可穿缝
+    #   - 小擦边+烂跟踪: res = saturate(0.44+0.7)=0.76  比"无碰+烂跟踪"差 → 被避免
+    #   - 大碰撞:       res → 1.0                       严格避免
+    res = saturate(
+        viol_obs / L1_SCALE + saturate(f_total / L2_SCALE)
+    )
+
+    return res
+
+
+# ======================================================================
+# 2b. Constran-based cost function (declarative, build() from Constraintdealer)
+#
+#     Same 2-level structure as the original, but expressed declaratively:
+#       L1 (outermost): obstacle collision → Deterministic(…, mode='soft')
+#       L2 (innermost):  tracking + smooth + control + reg → objective_fn
+#
+#     Key differences from original auto-scaling:
+#       - log_transform replaces viol_obs/L1_SCALE and f_total/L2_SCALE
+#       - No per-problem scale estimation (L1_SCALE, L2_SCALE)
+#       - penalize_only_soft=True: never rewards obstacle distance
+#       - k_inner=0.1: wide dynamic range for objective
+#
+#     Soft mode: obstacle violation and tracking ALWAYS compete additively.
+#     Small scrape + good tracking can beat no-scrape + bad tracking.
+#     This preserves the original's "可穿缝" (squeeze-through-gap) behavior.
+# ======================================================================
+
+def _tracking_objective(z_flat, ctx):
+    """L2 (innermost): tracking + final + smooth + control + mu regularization.
+
+    Uses pre-computed trajectory from ctx['trajectory'] and raw controls
+    from z_flat for regularization terms.
+    """
+    raw_actions = z_flat.reshape((CONFIG['horizon'], CONFIG['dim']))
+    vs = jnp.tanh(raw_actions[:, 0]) * CONFIG['max_v']
+    ws = jnp.tanh(raw_actions[:, 1]) * CONFIG['max_w']
+
+    trajectory = ctx['trajectory']
+    target = ctx['target_pos']
+
+    dist_to_target = jnp.linalg.norm(trajectory - target, axis=1)
+    cost_track = jnp.sum(dist_to_target) * 2.0
+    cost_final = jnp.linalg.norm(trajectory[-1] - target) * 15.0
+
+    cost_smooth = jnp.sum(jnp.diff(ws) ** 2) * 1.5 + jnp.sum(jnp.diff(vs) ** 2) * 0.5
+    cost_v = jnp.sum(vs ** 2) * 1.0 + jnp.sum(ws ** 2) * 0.5
+    mu_reg = 0.01 * (jnp.sum(raw_actions[:, 0] ** 2) + jnp.sum(raw_actions[:, 1] ** 2))
+
+    return cost_track + cost_final + cost_v + mu_reg
+
+
+def _obstacle_violation(z_flat, ctx):
+    """L1 (outermost): obstacle collision violation (raw sum of 1.5 + penetration).
+
+    Returns raw violation > 0 when any trajectory point penetrates an obstacle.
+    Constran applies log_transform → sigma_k → additive nesting automatically.
+    Uses the same 1.5 + penetration formula as the original for consistency.
+    """
+    trajectory = ctx['trajectory']
+    obs_pos = ctx['obs_pos']
+    safe_dist = ctx['safe_distance']
+
+    diff = trajectory[:, None, :] - obs_pos[None, :, :]
+    min_dists = jnp.min(jnp.linalg.norm(diff, axis=-1), axis=-1)
+    penetration = safe_dist - min_dists
+    return jnp.sum(jnp.where(penetration > 0.0, 1.5 + penetration, 0.0))
+
+
+# Build the nested cost via Constran (no jit — we wrap with rollout + jit below)
+# SOFT mode: obstacle always active, competes additively with tracking
+# penalize_only_soft=True: log_transform(g) clamped to ≥ 0 — never rewards being far
+_base_mpc_cost = build(
+    _tracking_objective,
+    [
+        Deterministic(_obstacle_violation, mode='soft', priority=1),
+    ],
+    k_inner=0.1,
+    penalize_only_soft=True,
+    jit_cost=False,
+)
+
+
+@jax.jit
+def mpc_cost_fn_constran(flat_actions, context):
+    """Constran-wrapped MPC cost — single trajectory rollout, modular constraints.
+
+    This is the solver-ready cost function. It:
+    1. Computes the unicycle trajectory from flat_actions (same as original).
+    2. Passes trajectory via extended context to the Constran-built cost.
+    3. Constran handles log_transform, σ nesting, and additive soft competition.
+
+    The solver sees the same (flat_actions, context) -> scalar interface.
+    """
+    raw_actions = flat_actions.reshape((CONFIG['horizon'], CONFIG['dim']))
+    vs = jnp.tanh(raw_actions[:, 0]) * CONFIG['max_v']
+    ws = jnp.tanh(raw_actions[:, 1]) * CONFIG['max_w']
+
+    x0, y0, theta0 = context['current_state']
+    dt = CONFIG['dt']
+
+    thetas = theta0 + jnp.cumsum(ws * dt)
+    thetas_prev = jnp.concatenate([jnp.array([theta0]), thetas[:-1]])
+
+    dx = vs * jnp.cos(thetas_prev) * dt
+    dy = vs * jnp.sin(thetas_prev) * dt
+    trajectory = jnp.stack([x0 + jnp.cumsum(dx), y0 + jnp.cumsum(dy)], axis=1)
+
+    # Extend context with computed trajectory
+    ext_ctx = dict(context)
+    ext_ctx['trajectory'] = trajectory
+    return _base_mpc_cost(flat_actions, ext_ctx)
+
 
 # ==============================================================================
 # 3. 改进的决策辅助函数
@@ -161,7 +320,26 @@ def _draw_frame(ax, robot_state, current_obs_pos, target_pos, mu_k, best_idx, co
     ax.set_title(f"Step {step} | Sticky Decision (Hysteresis) | Comp {best_idx} Chosen")
 
 
-def run_mpc_simulation(video_path="outcmaes/mpcmain21.mp4", steps=180, fps=20):
+def run_mpc_simulation(video_path="outcmaes/mpcmain21.gif", steps=350, fps=20,
+                       cost_mode='original'):
+    """Run MPC simulation.
+
+    cost_mode: 'original'  → auto-scaling + saturate (current behavior)
+               'constran'  → Constraintdealer.Constran.build() — declarative,
+                              log_transform, soft additive nesting
+    """
+    # Select cost function
+    if cost_mode == 'constran':
+        cost_fn = mpc_cost_fn_constran
+        mode_label = 'CONSTRAN'
+    else:
+        cost_fn = mpc_cost_fn
+        mode_label = 'ORIGINAL'
+
+    # Adjust video path for constran mode
+    if cost_mode == 'constran' and video_path == "outcmaes/mpcmain21.gif":
+        video_path = "outcmaes/mpcmain21_constran.gif"
+
     key = jax.random.PRNGKey(42)
     K = CONFIG['n_components']
 
@@ -170,8 +348,8 @@ def run_mpc_simulation(video_path="outcmaes/mpcmain21.mp4", steps=180, fps=20):
     key, subkey = jax.random.split(key)
     obs_phases = jax.random.uniform(subkey, (obs_num, 2)) * 2 * jnp.pi
 
-    mu_k = jax.random.normal(key, (K, TOTAL_DIM)) * 0.1
-    L_inv_k = jnp.stack([jnp.eye(TOTAL_DIM) * 0.1 for _ in range(K)])
+    mu_k = jax.random.normal(key, (K, TOTAL_DIM)) * 0.0
+    L_inv_k = jnp.stack([jnp.eye(TOTAL_DIM) * 1.0 for _ in range(K)])
     pi_k_all = jnp.ones(K) / K
 
     last_best_idx = 0
@@ -183,7 +361,7 @@ def run_mpc_simulation(video_path="outcmaes/mpcmain21.mp4", steps=180, fps=20):
     os.makedirs(output_dir, exist_ok=True)
     fig, ax = plt.subplots(figsize=(10, 8))
     comp_colors = plt.get_cmap('jet')(np.linspace(0, 1, K))
-    writer = FFMpegWriter(fps=fps, metadata={'title': 'IGO MPC Simulation', 'artist': 'MPCmain21'})
+    writer = PillowWriter(fps=fps, metadata={'title': 'IGO MPC Simulation', 'artist': 'MPCmain21'})
 
     with writer.saving(fig, video_path, dpi=120):
         for t in range(steps):
@@ -191,7 +369,7 @@ def run_mpc_simulation(video_path="outcmaes/mpcmain21.mp4", steps=180, fps=20):
 
             offsets = 0.25 * jnp.stack([jnp.sin(t * 0.1 + obs_phases[:, 0]), jnp.cos(t * 0.12 + obs_phases[:, 1])], axis=1)
             current_obs_pos = obs_initial_pos + offsets
-            target_pos = target_final + jnp.array([jnp.sin(t * 0.5), jnp.cos(t * 0.2)]) * 1.2
+            target_pos = target_final + jnp.array([jnp.sin(t * 0.1), jnp.cos(t * 0.2)]) * 0.2
 
             context_data = {
                 'current_state': robot_state, 'target_pos': target_pos,
@@ -202,7 +380,7 @@ def run_mpc_simulation(video_path="outcmaes/mpcmain21.mp4", steps=180, fps=20):
             iter_steps = CONFIG['warmup_steps'] if t == 0 else CONFIG['opt_steps']
             mu_k, L_inv_k, pi_k_all = igo_mog_optimizer(
                 subkey, iter_steps, 0.15, K, CONFIG['pop_size'], CONFIG['elite_size'],
-                mpc_cost_fn, mu_k, L_inv_k, pi_k_all, context_data
+                cost_fn, mu_k, L_inv_k, pi_k_all, context_data
             )
 
             hysteresis_bias = 0.00
@@ -242,13 +420,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run MPC simulation and export video.")
     parser.add_argument(
         "--video",
-        default=os.path.join("outcmaes", "mpcmain21.mp4"),
-        help="mp4"
+        default=os.path.join("outcmaes", "mpcmain21.gif"),
+        help="gif"
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=180,
+        default=350,
         help="simulation step"
     )
     parser.add_argument(
@@ -257,9 +435,17 @@ def parse_args():
         default=20,
         help="frequency"
     )
+    parser.add_argument(
+        "--mode",
+        default='original',
+        choices=['original', 'constran'],
+        help="Cost function: 'original' (auto-scaling + saturate) or "
+             "'constran' (Constraintdealer.Constran.build())"
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     cli_args = parse_args()
-    run_mpc_simulation(video_path=cli_args.video, steps=cli_args.steps, fps=cli_args.fps)
+    run_mpc_simulation(video_path=cli_args.video, steps=cli_args.steps,
+                       fps=cli_args.fps, cost_mode=cli_args.mode)
