@@ -499,7 +499,229 @@ def compose_objective_adaptive(
 
 
 # ===========================================================================
-# 5. Diagnostic: Inspect per-term contributions
+# 5. Dynamic k via ctx — Zero JAX Recompilation
+# ===========================================================================
+#
+#   k values live in ctx (not closure), so they can change every solver call
+#   without triggering JAX recompilation — ctx is already dynamic.
+#
+#   Pattern:
+#     1. calibrate_k_into_ctx(ctx, terms, ...) — initial calibration
+#     2. obj = compose_objective_dynamic(terms) — reads k from ctx
+#     3. For each MPC step: update_k_from_elite(ctx, terms, elite_x)
+#
+#   The cost function is compiled ONCE.  k tracks the improving population.
+
+def _compose_dynamic_kernel(parsed):
+    """Build a kernel that reads k from ctx instead of closure."""
+    def _kernel(x, ctx):
+        total = 0.0
+        for i, (term_fn, _, name) in enumerate(parsed):
+            raw = term_fn(x, ctx)
+            k = ctx[f'k_{name}']
+            total = total + sigma_k(log_transform(raw), k=k)
+        k_out = ctx.get('k_outer', 1.0)
+        return sigma_k(total, k=k_out)
+    return _kernel
+
+
+def compose_objective_dynamic(
+    terms,
+    *,
+    jit_result: bool = True,
+) -> Callable[[jnp.ndarray, Any], jnp.ndarray]:
+    """Compose sub-objectives with k read from ctx (no recompilation).
+
+    Like ``compose_objective``, but k values are read from ``ctx['k_{name}']``
+    at call time instead of being captured in a closure.  This means you can
+    change k between solver calls — e.g. after every MPC step — without
+    triggering JAX recompilation.
+
+    The returned cost function expects ctx to contain:
+    - ``ctx['k_{name}']`` for each term (float)
+    - ``ctx['k_outer']`` (float, optional; defaults to 1.0)
+
+    Use ``calibrate_k_into_ctx()`` to populate the initial k values, and
+    ``update_k_from_elite()`` to adjust them as the optimizer converges.
+
+    Parameters
+    ----------
+    terms : list of (callable, float_or_None, str)
+        ``(term_fn, k_placeholder, name)``.  The k value is NOT used at
+        build time; it only serves to document the term.  Pass 0.0 or any
+        dummy value.  The real k comes from ctx at call time.
+    jit_result : bool
+        If True, wrap with ``jax.jit``.
+
+    Returns
+    -------
+    cost_fn : (x, ctx) -> scalar in [0, 1)
+        Requires ``ctx['k_{name}']`` for each term.
+
+    Examples
+    --------
+    >>> # 1. Initial calibration
+    >>> ctx = calibrate_k_into_ctx(ctx, [
+    ...     (track_fn, 'primary', "tracking"),
+    ...     (final_fn, 'secondary', "final"),
+    ... ], n_dims=16, bounds=(-5,5), n_samples=500)
+    >>> # ctx now has ctx['k_tracking'], ctx['k_final']
+    >>>
+    >>> # 2. Build once
+    >>> obj = compose_objective_dynamic([
+    ...     (track_fn, 0.0, "tracking"),
+    ...     (final_fn, 0.0, "final"),
+    ... ])
+    >>>
+    >>> # 3. Use in MPC loop — update k each step
+    >>> for step in range(T_mpc):
+    ...     result = solver(..., fitness_fn_total=obj, context=ctx)
+    ...     elite_x = extract_best(result)
+    ...     ctx = update_k_from_elite(ctx, terms, elite_x)
+    """
+    parsed = []
+    for i, t in enumerate(terms):
+        fn = t[0]
+        name = t[2] if len(t) > 2 else f"term_{i}"
+        parsed.append((fn, 0.0, name))  # k placeholder — real k from ctx
+
+    kernel = _compose_dynamic_kernel(parsed)
+    if jit_result:
+        return jax.jit(kernel)
+    return kernel
+
+
+def calibrate_k_into_ctx(
+    ctx: dict,
+    terms,
+    *,
+    n_dims=None, bounds=None, n_samples=500, key=None,
+    sample_fn=None, warmup_samples=None,
+    role_percentiles=None,
+    min_knee=1e-10,
+    verbose=True,
+) -> dict:
+    """Calibrate k from samples and write them into ctx.
+
+    This is a convenience wrapper around the calibration logic in
+    ``compose_objective_adaptive``.  It evaluates each term on calibration
+    samples, computes the knee from the role's percentile, converts to k,
+    and writes ``ctx['k_{name}']`` for each term.
+
+    Parameters
+    ----------
+    ctx : dict
+        Existing context dict.  Modified in-place and returned.
+    terms : list of (callable, role, name)
+        Same format as ``compose_objective_adaptive``.
+    Other parameters : see ``compose_objective_adaptive``.
+
+    Returns
+    -------
+    ctx : dict
+        The same dict, now with ``ctx['k_{name}']`` entries populated.
+
+    Examples
+    --------
+    >>> ctx = {'target': jnp.array([8.0, 6.0])}
+    >>> ctx = calibrate_k_into_ctx(ctx, [
+    ...     (track_fn, 'primary', "tracking"),
+    ...     (final_fn, 'secondary', "final"),
+    ... ], n_dims=16, bounds=(-5,5))
+    >>> print(ctx['k_tracking'], ctx['k_final'])
+    """
+    effective_roles = dict(ROLE_PERCENTILES)
+    if role_percentiles is not None:
+        effective_roles.update(role_percentiles)
+
+    parsed = []
+    for i, t in enumerate(terms):
+        fn = t[0]
+        role_or_pct = t[1]
+        name = t[2] if len(t) > 2 else f"term_{i}"
+        percentile = _parse_role(role_or_pct, effective_roles)
+        parsed.append((fn, percentile, name))
+
+    samples = _generate_calibration_samples(
+        n_dims=n_dims, bounds=bounds, n_samples=n_samples,
+        key=key, sample_fn=sample_fn, warmup_samples=warmup_samples,
+    )
+
+    if verbose:
+        print("--- Dynamic K Calibration ---")
+    for fn, percentile, name in parsed:
+        k = _calibrate_k_from_samples(fn, percentile, samples, ctx, min_knee)
+        ctx[f'k_{name}'] = k
+        if verbose:
+            knee = float(k_to_knee(k))
+            print(f"  k_{name:20s}: P{int(percentile*100):02d}  "
+                  f"knee={knee:.4f}  k={k:.4f}")
+
+    return ctx
+
+
+def update_k_from_elite(
+    ctx: dict,
+    terms,
+    elite_x: jnp.ndarray,
+    *,
+    multiplier: float = 5.0,
+    min_knee: float = 1e-10,
+    verbose: bool = False,
+) -> dict:
+    """Update ctx k-values based on the current elite (best) solution.
+
+    For each term, evaluates it on ``elite_x``, sets the knee to
+    ``raw_value * multiplier``, and derives k.  The multiplier provides
+    headroom: at multiplier=5, the knee is 5× the current best, leaving
+    room for further improvement while keeping the term in its sensitive
+    region.
+
+    Call this after each solver invocation in an MPC loop.
+    Zero extra solver evaluations — the elite solution is already computed.
+
+    Parameters
+    ----------
+    ctx : dict
+        Context dict.  Modified in-place and returned.
+    terms : list of (callable, role_or_None, name)
+        The same term functions used for calibration.
+    elite_x : jnp.ndarray
+        The current best decision vector from the solver.
+    multiplier : float
+        knee = raw_value * multiplier.  Default 5.0.
+    min_knee : float
+        Floor on knee to avoid division by zero.
+    verbose : bool
+        If True, print updated k values.
+
+    Returns
+    -------
+    ctx : dict
+
+    Examples
+    --------
+    >>> # In MPC loop after solver returns:
+    >>> elite_x = final_mu[0, best_idx]  # best solution
+    >>> ctx = update_k_from_elite(ctx, terms, elite_x)
+    """
+    if verbose:
+        print("--- Dynamic K Update (from elite) ---")
+    for i, t in enumerate(terms):
+        fn = t[0]
+        name = t[2] if len(t) > 2 else f"term_{i}"
+        raw = float(fn(elite_x, ctx))
+        knee = max(raw * multiplier, min_knee)
+        k = float(knee_to_k(knee))
+        ctx[f'k_{name}'] = k
+        if verbose:
+            print(f"  k_{name:20s}: raw={raw:.4f}  "
+                  f"knee={knee:.4f}  k={k:.4f}")
+    return ctx
+
+
+# ===========================================================================
+# 6. Diagnostic: Inspect per-term contributions
 # ===========================================================================
 
 def inspect_terms(
@@ -545,7 +767,7 @@ def inspect_terms(
 
 # ===========================================================================
 # ===========================================================================
-# 6. Quick self-test (run when executed directly)
+# 7. Quick self-test (run when executed directly)
 # ===========================================================================
 # ===========================================================================
 

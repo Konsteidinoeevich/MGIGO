@@ -463,6 +463,211 @@ def build_unconstrained(objective_fn: Callable,
 
 
 # ===========================================================================
+# 5b. Dynamic Gamma — Hard-Constraint Sensitivity via ctx
+# ===========================================================================
+#
+#   Hard constraints suffer from flat-cost collapse: as violations shrink,
+#   T(g) becomes tiny relative to δ, making σ(T(g)+δ) nearly flat.
+#   The solver loses sensitivity within the violation region.
+#
+#   Fix: T(g) * gamma + δ, where gamma is read from ctx and updated from
+#   the elite solution.  Gamma defaults to 1.0 → backward compatible.
+#
+#   See ObjectiveComposer_README.md §8.4 for the blow-up chain analysis.
+
+def _assemble_nest_dynamic(objective_fn, layers, k_inner=0.1,
+                            penalize_only_soft=False):
+    """Like _assemble_nest, but hard constraints read gamma from ctx."""
+    def cost_fn(x, ctx):
+        inner = sigma_k(log_transform(objective_fn(x, ctx)), k=k_inner)
+
+        for _priority, mode, params, viol_fn in layers:
+            g_raw = viol_fn(x, ctx)
+
+            if mode == 'hard':
+                delta = params.get('delta', 3.0)
+                gamma = ctx.get(f'gamma_{_priority}', 1.0)
+                inner = sigma_k(
+                    jnp.where(g_raw > 0,
+                              log_transform(g_raw) * gamma + delta,
+                              inner)
+                )
+            elif mode == 'tunable':
+                delta_soft = params.get('delta_soft', 2.0)
+                beta = params.get('beta', 5.0)
+                t_val = log_transform(g_raw)
+                if penalize_only_soft:
+                    t_val = jnp.maximum(0.0, t_val)
+                contrib = delta_soft * sigma_k(beta * t_val)
+                inner = sigma_k(contrib + inner)
+            else:  # 'soft'
+                t_val = log_transform(g_raw)
+                if penalize_only_soft:
+                    t_val = jnp.maximum(0.0, t_val)
+                inner = sigma_k(t_val + inner)
+
+        return inner
+    return cost_fn
+
+
+def build_dynamic(
+    objective_fn: Callable[[jnp.ndarray, Any], jnp.ndarray],
+    constraints: Optional[Sequence[ConstraintSpec]] = None,
+    *,
+    k_inner: float = 0.1,
+    penalize_only_soft: bool = False,
+    validate: bool = True,
+    jit_cost: bool = True,
+) -> Callable[[jnp.ndarray, Any], jnp.ndarray]:
+    """Build a solver-ready cost function with dynamic gamma for hard constraints.
+
+    Identical to ``build()``, except hard constraints read a per-layer gamma
+    value from ctx:
+
+        ``gamma = ctx.get('gamma_{priority}', 1.0)``
+
+    Gamma defaults to 1.0 — backward compatible with ``build()``.
+    When gamma > 1, the violation signal T(g) is amplified relative to δ,
+    maintaining sensitivity even for small violations.
+
+    Use ``calibrate_gamma_into_ctx()`` to set initial gamma values, and
+    ``update_gamma_from_elite()`` to adjust them as optimization converges.
+
+    Parameters
+    ----------
+    Same as ``build()``.
+
+    Returns
+    -------
+    cost_fn : (x, ctx) -> scalar
+    """
+    if constraints is None:
+        constraints = []
+
+    if validate:
+        _validate_constraints(constraints)
+
+    specs_sorted = sorted(constraints, key=lambda s: s.priority, reverse=True)
+
+    hard_specs = [s for s in specs_sorted if s.mode == 'hard']
+    for i, spec in enumerate(hard_specs):
+        if spec.delta is None:
+            is_outermost = (spec.priority == min(s.priority for s in hard_specs))
+            spec.delta = 1.5 if is_outermost else 3.0
+
+    layers = []
+    for spec in specs_sorted:
+        viol_fn = _make_violation_fn(spec)
+        params = {}
+        if spec.mode == 'hard':
+            params['delta'] = spec.delta if spec.delta is not None else 3.0
+        elif spec.mode == 'tunable':
+            params['delta_soft'] = (spec.delta_soft if spec.delta_soft is not None
+                                    else 2.0)
+            params['beta'] = spec.beta if spec.beta is not None else 5.0
+        layers.append((spec.priority, spec.mode, params, viol_fn))
+
+    cost_fn = _assemble_nest_dynamic(objective_fn, layers,
+                                      k_inner=k_inner,
+                                      penalize_only_soft=penalize_only_soft)
+    if jit_cost:
+        return jax.jit(cost_fn)
+    return cost_fn
+
+
+def calibrate_gamma_into_ctx(
+    ctx: dict,
+    constraints: Sequence[ConstraintSpec],
+    *,
+    delta_default: float = 1.5,
+    initial_gamma: float = 1.0,
+    verbose: bool = True,
+) -> dict:
+    """Write initial gamma values into ctx for dynamic hard constraints.
+
+    Sets ``ctx['gamma_{priority}'] = initial_gamma`` (default 1.0) for each
+    hard-constraint layer.  A gamma of 1.0 means no amplification — identical
+    behavior to ``build()``.
+
+    Parameters
+    ----------
+    ctx : dict — modified in-place and returned.
+    constraints : list of ConstraintSpec
+    delta_default : float — used to determine which constraints are hard (has delta)
+    initial_gamma : float — initial gamma value (default 1.0)
+    verbose : bool
+
+    Returns
+    -------
+    ctx : dict
+    """
+    if verbose:
+        print("--- Dynamic Gamma Setup ---")
+    for spec in constraints:
+        if spec.mode == 'hard':
+            key = f'gamma_{spec.priority}'
+            ctx[key] = initial_gamma
+            if verbose:
+                print(f"  {key}: {initial_gamma} (initial, no amplification)")
+    return ctx
+
+
+def update_gamma_from_elite(
+    ctx: dict,
+    constraint_fns: Sequence[Tuple[Callable, int]],
+    elite_x: jnp.ndarray,
+    *,
+    default_delta: float = 1.5,
+    min_T_gamma: float = 1e-6,
+    verbose: bool = False,
+) -> dict:
+    """Update gamma for each hard-constraint layer from the elite solution.
+
+    For each constraint, evaluates the raw violation on ``elite_x``.
+    If violated (g > 0), sets gamma = delta / T(g) so that T(g)·gamma ≈ delta,
+    keeping the violation contribution comparable to the offset.
+
+    ``min_T_gamma`` floors T(g) when computing gamma — a pure numerical
+    safety against division by zero.  Default 1e-6 (γ_max ≈ 1.5e6).
+    Sigma naturally bounds the cost to [0,1] regardless of gamma, so a
+    large gamma cannot cause overflow.  The real safety mechanism is
+    ``reset_gamma()`` at the start of each MPC step.
+
+    If satisfied (g <= 0), leaves gamma unchanged — the constraint is no
+    longer the bottleneck.
+
+    Parameters
+    ----------
+    ctx : dict — modified in-place and returned.
+    constraint_fns : list of (viol_fn, priority)
+        Each ``viol_fn(x, ctx) -> g_raw`` should be the SAME function passed
+        to ``Deterministic``.  Priority matches the constraint's priority.
+    elite_x : jnp.ndarray — current best decision vector.
+    default_delta : float — delta value for constraints without explicit delta.
+    min_T_gamma : float — floor on T(g) in gamma denominator (default 5e-4).
+    verbose : bool
+
+    Returns
+    -------
+    ctx : dict
+    """
+    if verbose:
+        print("--- Dynamic Gamma Update (from elite) ---")
+    for viol_fn, priority in constraint_fns:
+        g_raw = float(viol_fn(elite_x, ctx))
+        key = f'gamma_{priority}'
+        if g_raw > 0:
+            T_g = float(log_transform(jnp.array(g_raw)))
+            gamma = default_delta / max(T_g, min_T_gamma)
+            ctx[key] = gamma
+            if verbose:
+                print(f"  gamma_{priority}: g={g_raw:.6f}  T(g)={T_g:.4f}  "
+                      f"gamma={gamma:.2f}")
+        else:
+            if verbose:
+                print(f"  gamma_{priority}: g={g_raw:.6f} (satisfied, "
+                      f"gamma unchanged = {ctx.get(key, 1.0):.2f})")
+    return ctx# ===========================================================================
 # 6. Validation & Diagnostics
 # ===========================================================================
 

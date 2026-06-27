@@ -1,5 +1,5 @@
 """
-ObjectiveComposer Demo — Manual Weights vs Composed vs Auto-k
+ObjectiveComposer Demo — Manual vs Adaptive vs Dynamic
 =============================================================
 
 Demonstrates how ``compose_objective`` replaces manual weight tuning with
@@ -38,7 +38,8 @@ import numpy as np
 from jax import random, jit, vmap
 
 from Constraintdealer.ObjectiveComposer import (
-    compose_objective, compose_objective_auto, compose_objective_adaptive,
+    compose_objective_adaptive, compose_objective_dynamic,
+    calibrate_k_into_ctx, update_k_from_elite,
     knee_to_k, k_to_knee, suggest_k
 )
 from Constraintdealer.Constran import sigma_k, log_transform
@@ -131,31 +132,7 @@ def cost_manual(z_flat, ctx):
     return sigma_k(log_transform(f_total), k=0.5)
 
 
-# --- Mode 2: Composed (per-term k) ---
-_cost_composed_base = compose_objective([
-    (tracking_term,   0.5, "tracking"),     # knee ~6.4 — wide range
-    (final_term,      2.0, "final"),        # knee ~0.65 — precise
-    (smoothness_term, 1.0, "smoothness"),   # knee ~1.7 — balanced
-])
-
-@jit
-def cost_composed(z_flat, ctx):
-    return _cost_composed_base(z_flat, ctx)
-
-
-# --- Mode 3: Auto-k ---
-_cost_auto_base = compose_objective_auto([
-    (tracking_term,   5.0,  200.0),   # typical ~5, max ~200
-    (final_term,      0.5,  20.0),    # typical ~0.5, max ~20
-    (smoothness_term, 1.0,  50.0),    # typical ~1, max ~50
-])
-
-@jit
-def cost_auto(z_flat, ctx):
-    return _cost_auto_base(z_flat, ctx)
-
-
-# --- Mode 4: Adaptive (semantic roles, auto-calibrated k) ---
+# --- Mode 2: Adaptive (semantic roles, auto-calibrated k) ---
 # Uses compose_objective_adaptive — each term gets a semantic role instead of k.
 # Calibration happens ONCE here (module load time).
 _cost_adaptive_base = compose_objective_adaptive([
@@ -169,6 +146,35 @@ _cost_adaptive_base = compose_objective_adaptive([
 @jit
 def cost_adaptive(z_flat, ctx):
     return _cost_adaptive_base(z_flat, ctx)
+
+
+# --- Mode 3: Dynamic (k in ctx, updated from elite) ---
+# Calibrate initial k into ctx (once)
+_dynamic_ctx = {
+    'init_state': jnp.array([0.0, 0.0, 0.0, 0.0]),
+    'target': jnp.array([8.0, 6.0]),
+}
+_dynamic_ctx = calibrate_k_into_ctx(_dynamic_ctx, [
+    (tracking_term,   'primary',    'tracking'),
+    (final_term,      'secondary',  'final'),
+    (smoothness_term, 'tiebreaker', 'smoothness'),
+], n_dims=16, bounds=(-5.0, 5.0), n_samples=800)
+
+# Build once — k read from ctx at call time
+_cost_dynamic_base = compose_objective_dynamic([
+    (tracking_term,   0.0, 'tracking'),
+    (final_term,      0.0, 'final'),
+    (smoothness_term, 0.0, 'smoothness'),
+])
+
+@jit
+def cost_dynamic(z_flat, ctx):
+    # Merge fixed ctx with dynamic k values
+    full_ctx = dict(ctx)
+    full_ctx['k_tracking'] = _dynamic_ctx['k_tracking']
+    full_ctx['k_final'] = _dynamic_ctx['k_final']
+    full_ctx['k_smoothness'] = _dynamic_ctx['k_smoothness']
+    return _cost_dynamic_base(z_flat, full_ctx)
 
 
 # ===========================================================================
@@ -193,15 +199,14 @@ def run_comparison():
         ty = random.uniform(random.fold_in(k, 1), (H,), minval=-3.0, maxval=3.0)
         z_samples.append(jnp.concatenate([tx, ty]))
 
-    # Evaluate all four cost functions
+    # Evaluate all three cost functions
     manual_vals = np.array([float(cost_manual(z, ctx)) for z in z_samples])
-    composed_vals = np.array([float(cost_composed(z, ctx)) for z in z_samples])
-    auto_vals = np.array([float(cost_auto(z, ctx)) for z in z_samples])
     adaptive_vals = np.array([float(cost_adaptive(z, ctx)) for z in z_samples])
+    dynamic_vals = np.array([float(cost_dynamic(z, ctx)) for z in z_samples])
 
     # --- Report ---
     print("=" * 70)
-    print("ObjectiveComposer Demo — Manual vs Composed vs Auto-k")
+    print("ObjectiveComposer Demo — Manual vs Adaptive vs Dynamic")
     print("=" * 70)
     print(f"  Scenario: 2D vehicle, H={H}, n_samples={n_samples}")
     print(f"  Start: (0,0) → Target: (8,6)")
@@ -220,29 +225,6 @@ def run_comparison():
     print(f"  Mean: {manual_vals.mean():.4f}  Std: {manual_vals.std():.4f}")
     print()
 
-    print("--- Composed (per-term k) ---")
-    from Constraintdealer.ObjectiveComposer import k_to_knee
-    for name, k in [("tracking", 0.5), ("final", 2.0), ("smoothness", 1.0)]:
-        knee = float(k_to_knee(k))
-        print(f"  {name:12s}: k={k:.1f}  →  knee at raw ≈ {knee:.2f}")
-    print(f"  Cost range: [{composed_vals.min():.4f}, {composed_vals.max():.4f}]")
-    print(f"  Mean: {composed_vals.mean():.4f}  Std: {composed_vals.std():.4f}")
-    print()
-
-    print("--- Auto-k (suggest_k) ---")
-    for name, typ, mx, k in [("tracking", 5.0, 200.0,
-                               float(suggest_k(5.0, 200.0))),
-                              ("final", 0.5, 20.0,
-                               float(suggest_k(0.5, 20.0))),
-                              ("smoothness", 1.0, 50.0,
-                               float(suggest_k(1.0, 50.0)))]:
-        knee = float(k_to_knee(k))
-        print(f"  {name:12s}: typical={typ:.1f}, max={mx:.0f}  "
-              f"→ k={k:.4f}  →  knee ≈ {knee:.2f}")
-    print(f"  Cost range: [{auto_vals.min():.4f}, {auto_vals.max():.4f}]")
-    print(f"  Mean: {auto_vals.mean():.4f}  Std: {auto_vals.std():.4f}")
-    print()
-
     print("--- Adaptive (semantic roles, auto-calibrated k) ---")
     print(f"  Roles: tracking='primary' (P50), final='secondary' (P70),")
     print(f"         smoothness='tiebreaker' (P95)")
@@ -251,13 +233,20 @@ def run_comparison():
     print(f"  Mean: {adaptive_vals.mean():.4f}  Std: {adaptive_vals.std():.4f}")
     print()
 
+    print("--- Dynamic (k in ctx, no JIT recompile) ---")
+    print(f"  k read from ctx — can change between solver calls")
+    print(f"  Initial calibration: same as adaptive mode")
+    print(f"  Cost range: [{dynamic_vals.min():.4f}, {dynamic_vals.max():.4f}]")
+    print(f"  Mean: {dynamic_vals.mean():.4f}  Std: {dynamic_vals.std():.4f}")
+    print(f"  JAX recompiles: 1 (at build time)")
+    print()
+
     # --- Key insight ---
     print("--- Key Observations ---")
     print(f"  1. All three modes bounded in [0, 1): ✓")
-    print(f"  2. Composed k chosen by physical meaning (meters, jerk units)")
-    print(f"     → no dimensionless weights to tune")
-    print(f"  3. Auto-k uses only typical/max values → no manual k selection")
-    print(f"  4. Manual weights require trial-and-error per problem")
+    print(f"  2. Adaptive k: semantic roles → auto-calibrated, no magnitude guesswork")
+    print(f"  3. Dynamic k: tracks optimization progress, prevents flat-cost collapse")
+    print(f"  4. Manual weights: fragile, per-problem trial-and-error")
     print()
     print("  See Constraintdealer/ObjectiveComposer_README.md for full guide.")
 
@@ -278,8 +267,8 @@ def run_optimization(mode='composed'):
     target = jnp.array([8.0, 6.0])
     ctx = {'init_state': init_state, 'target': target}
 
-    cost_fn = {'manual': cost_manual, 'composed': cost_composed,
-               'auto': cost_auto, 'adaptive': cost_adaptive}[mode]
+    cost_fn = {'manual': cost_manual, 'adaptive': cost_adaptive,
+               'dynamic': cost_dynamic}[mode]
 
     initial_mu = jnp.zeros((M, K, H))
     for c in range(K):
@@ -328,7 +317,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="ObjectiveComposer demo — manual vs composed vs auto-k")
     parser.add_argument('--mode', default='all',
-                        choices=['all', 'manual', 'composed', 'auto', 'adaptive',
+                        choices=['all', 'manual', 'adaptive', 'dynamic',
                                  'compare'],
                         help="Which mode(s) to run")
     parser.add_argument('--optimize', action='store_true',

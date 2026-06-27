@@ -740,4 +740,109 @@ Soft 等于 Tunable 取 β→0, δ→∞ 的极限——对数增长永不饱和
 "小违反可以忍，但要平滑过渡"	Tunable, 调 β 定容忍区宽度
 "多点小违反 vs 单点大违反，我要区分"	Soft 或 Tunable β<1
 "违反只看最坏的那个点"	用 lax.scan(max) 而不是 sum
+
+---
+
+## 11. 动态 Gamma — 硬约束的敏感度保持
+
+### 11.1 问题：硬约束在违反区内 cost 平坦
+
+硬约束公式 `σ(T(g) + δ)` 中，δ=1.5 是固定的。当违反 g 很小时，
+T(g) ≪ δ，δ 压倒了违反信号：
+
+```
+g=100: T(g)=4.6 → σ(6.1)=0.987
+g=1:   T(g)=0.69 → σ(2.19)=0.910
+g=0.1: T(g)=0.095 → σ(1.60)=0.847
+g=0.01: T(g)=0.010 → σ(1.51)=0.834  ← δ 完全压制 T(g)
+g=0.001:T(g)=0.001 → σ(1.50)=0.832  ← 和 g=0.01 几乎没区别
+```
+
+在 g∈[0.001, 0.1] 区间，cost 变化量仅 ~0.015。求解器在这段违反区内"瞎了"——分不清
+微小违反和较大违反，找不到回可行域的方向。
+
+### 11.2 解法：动态 γ = δ / T(g_best)
+
+在违反项前加一个来自 ctx 的缩放因子：
+
+```
+σ( T(g) · γ + δ + inner )
+```
+
+每次求解器收敛后，从精英解（当前最好的解）上评估违反值 g_best，计算：
+
+```
+γ = δ / T(g_best)
+```
+
+这样 T(g_best)·γ = δ —— 最优违反的贡献恰好等于偏移量。无论违反多小。
+
+```
+g_best=100: γ=0.32 → T(0.1)*γ=0.03  (大违反时 γ 小，不放大)
+g_best=0.1: γ=15.7 → T(0.1)*γ=1.50  (小违反时 γ 大，放大到和 δ 同级)
+g_best=0.01: γ=150 → T(0.01)*γ=1.50  (始终把贡献拉到 δ 量级)
+```
+
+灵敏度对比（g_best=0.05）：
+
+| g | 固定 γ=1 | 动态 γ=30.7 |
+|---|----------|------------|
+| 0.2 | σ=0.860（平坦）| σ=0.990（敏感）|
+| 0.1 | σ=0.847（平坦）| σ=0.975（敏感）|
+| 0.05 | σ=0.840（平坦）| σ=0.949（knee区）|
+| 0.03 | σ=0.837（平坦）| σ=0.924（knee区）|
+| Δσ | 0.023 | 0.066（3x 更敏感）|
+
+### 11.3 API：build_dynamic + update_gamma_from_elite
+
+```python
+from Constraintdealer.Constran import build_dynamic, Deterministic, update_gamma_from_elite
+
+# 构建 — 和 build() 完全相同的接口
+constraints = [
+    Deterministic(viol_obstacle, mode='hard', priority=1),
+    Deterministic(viol_pedestrian, mode='hard', priority=2),
+]
+cost_fn = build_dynamic(objective_fn, constraints)
+
+# MPC 循环
+for step in range(T_mpc):
+    # gamma 默认 1.0 — 安全，等同于 build()
+    result = solver(..., fitness_fn_total=cost_fn, context=ctx)
+
+    # 更新 gamma 为下一步准备
+    elite_x = extract_best(result)
+    ctx = update_gamma_from_elite(
+        ctx,
+        [(viol_obstacle, 1), (viol_pedestrian, 2)],  # (viol_fn, priority)
+        elite_x,
+    )
+```
+
+**关键属性**：
+- gamma 默认 = 1.0（ctx 里没有 key 也正常工作，无需 calibrate）
+- `update_gamma_from_elite` 每次从 scratch 重算（不依赖旧值，无需 reset）
+- gamma 在 ctx 里 → 不触发 JAX 重编译
+- Sigma 限幅：无论 γ 多大，cost ≤ 1.0
+
+### 11.4 为什么单靠 log_transform 不够
+
+log_transform 压缩了量级但保序——T(0.1)=0.095 > T(0.01)=0.010，是对的。
+问题是 **δ=1.5 这个固定偏移量**。T(g)+δ 中 δ 的占比随着 g→0 趋于 100%，
+"违反信号 / 総输入" 趋近于零。不是 log_transform 的问题，是加法结构的问题。
+γ 修复了这个结构性问题。
+
+### 11.5 与动态 k 的互补
+
+| 参数 | 控制什么 | 防止什么 |
+|------|---------|---------|
+| 动态 k (objective) | objective 在 sigma 中的 knee 位置 | objective 量级漂移导致平坦 |
+| 动态 γ (hard constraint) | 违反贡献相对于 δ 的比例 | δ 固定导致违反区平坦 |
+
+两者都不触发 JAX 重编译。见 ObjectiveComposer_README.md §8。
+
+### 11.6 软约束不需要动态 γ
+
+软约束 `σ(T(g) + σ(T(f), k_obj))` 中没有 δ 偏移——T(g) 直接参与加性竞争。
+只要 objective 的动态 k 保证 σ(T(f)) 不饱和，余量就足以接收 T(g)。
 框架给了你全套积木，语义你自己定。

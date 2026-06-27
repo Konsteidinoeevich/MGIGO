@@ -68,33 +68,33 @@ means... nothing physical.
 
 ## 4. Quick Start
 
-### 4.1 Basic Usage
+### 4.1 Recommended: Adaptive (semantic roles)
 
 ```python
-from Constraintdealer.ObjectiveComposer import compose_objective
+from Constraintdealer.ObjectiveComposer import compose_objective_adaptive
 
-obj = compose_objective([
-    (tracking_fn,   0.5, "tracking"),     # knee ~6.4 — wide range
-    (final_fn,      2.0, "final"),        # knee ~0.65 — precise
-    (control_fn,    1.0, "control"),      # knee ~1.7 — balanced
-])
+ctx_calib = {'target': jnp.array([8.0, 6.0]),
+             'init_state': jnp.array([0., 0., 0., 0.])}
+
+obj = compose_objective_adaptive([
+    (tracking_fn,   'primary',    "tracking"),     # P50: knee at median
+    (final_fn,      'secondary',  "final"),        # P70
+    (control_fn,    'tiebreaker', "control"),      # P95
+], n_dims=16, bounds=(-5.0, 5.0), n_samples=500,
+   ctx_calib=ctx_calib)
 # obj is a standard (x, ctx) -> scalar callable, output in [0, 1)
 ```
 
-### 4.2 Integration with Constran.build()
+### 4.2 Production: Dynamic (k tracks optimization progress)
+
+See [§8 Dynamic k](#8-dynamic-k--zero-jax-recompilation).
+
+### 4.3 Integration with Constran.build()
 
 ```python
 from Constraintdealer.Constran import build, Deterministic
-from Constraintdealer.ObjectiveComposer import compose_objective
 
-# Step 1: compose the objective
-obj = compose_objective([
-    (tracking_fn,   0.5, "tracking"),
-    (final_fn,      2.0, "final"),
-    (control_fn,    1.0, "control"),
-])
-
-# Step 2: build with constraints (just like any objective_fn)
+# obj from compose_objective_adaptive or compose_objective_dynamic
 cost_fn = build(obj, [
     Deterministic(obs_fn,  mode='hard', priority=1),
     Deterministic(ped_fn,  mode='hard', priority=2),
@@ -102,21 +102,6 @@ cost_fn = build(obj, [
 
 # Step 3: pass to solver
 result = mmog_igo_optimizer_mpc(..., fitness_fn_total=cost_fn, ...)
-```
-
-### 4.3 Auto-k Mode
-
-Don't want to choose k manually? Use `compose_objective_auto`:
-
-```python
-from Constraintdealer.ObjectiveComposer import compose_objective_auto
-
-obj = compose_objective_auto([
-    (tracking_fn,   5.0,  200.0),   # typical ~5, max ~200
-    (final_fn,      0.5,  20.0),    # typical ~0.5, max ~20
-    (control_fn,    1.0,  50.0),    # typical ~1, max ~50
-])
-# k is auto-computed via suggest_k(typical, max)
 ```
 
 ### 4.4 Diagnosing Per-Term Contributions
@@ -160,18 +145,18 @@ def my_objective(z_flat, ctx):
     return f
 ```
 
-### After: Compose Objective
+### After: Adaptive
 
 ```python
-from Constraintdealer.ObjectiveComposer import compose_objective
+from Constraintdealer.ObjectiveComposer import compose_objective_adaptive
 
-obj = compose_objective([
-    (compute_tracking,   0.2, "tracking"),    # knee ~147 — longitudinal
-    (compute_final_error,2.0, "final"),       # knee ~0.65 — precise
-    (compute_smoothness, 1.0, "smoothness"),  # knee ~1.7 — balanced
-    (compute_control,    0.5, "control"),     # knee ~6.4 — moderate
-])
-# Done. No weights. Each k is chosen once based on physical meaning.
+obj = compose_objective_adaptive([
+    (compute_tracking,   'primary',    "tracking"),    # P50 — auto knee
+    (compute_final_error,'secondary',  "final"),       # P70
+    (compute_smoothness, 'tiebreaker', "smoothness"),  # P95
+    (compute_control,    'tiebreaker', "control"),     # P95
+], n_dims=16, bounds=(-5,5), n_samples=500, ctx_calib=ctx)
+# Done. No weights, no k. Just semantic roles.
 # Output always in [0, 1). Pass directly to Constran.build().
 ```
 
@@ -287,23 +272,104 @@ cost_fn = build(obj, [Deterministic(obs_fn, mode='hard', priority=1)])
 # cost_fn ready for solver
 ```
 
-## 8. API Reference
+## 8. Dynamic k — Zero JAX Recompilation
 
-### `compose_objective(terms, *, k_outer=1.0, jit_result=True)`
+When cost magnitudes shift during optimization (e.g., tracking error drops from
+~500 at initialization to ~10 at convergence), a static k calibrated from early
+samples becomes too wide — terms lose sensitivity when they need it most.
 
-Main entry point. Each term is `(fn, k)` or `(fn, k, name)`.
+The solution: **put k in ctx** instead of a closure.  ctx is already dynamic
+(MPC updates target/obstacles every step), so changing k values in ctx does
+NOT trigger JAX recompilation.
 
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `terms` | list of tuple | required | `(fn, k, name?)` per sub-objective |
-| `k_outer` | float | 1.0 | Final compression knee |
-| `jit_result` | bool | True | Wrap with `jax.jit` |
+### 8.1 Three Functions
 
-Returns `(x, ctx) -> scalar` in [0, 1).
+| Function | Role |
+|----------|------|
+| `calibrate_k_into_ctx(ctx, terms, ...)` | Initial calibration → writes `ctx['k_{name}']` |
+| `compose_objective_dynamic(terms)` | Build cost fn that reads k from ctx |
+| `update_k_from_elite(ctx, terms, elite_x)` | Update k from best solution (knee = raw×5) |
 
-### `compose_objective_auto(terms, *, k_outer=1.0, jit_result=True)`
+### 8.2 MPC Loop Pattern
 
-Auto-suggest k from typical and max. Each term is `(fn, typical, max_or_None)`.
+```python
+from Constraintdealer.ObjectiveComposer import (
+    compose_objective_dynamic, calibrate_k_into_ctx, update_k_from_elite
+)
+
+# 1. Initial calibration (once)
+ctx = calibrate_k_into_ctx(ctx, [
+    (track_fn, 'primary',    'tracking'),
+    (final_fn, 'secondary',  'final'),
+], n_dims=16, bounds=(-5,5), n_samples=500)
+
+# 2. Build cost function (once)
+obj = compose_objective_dynamic([
+    (track_fn, 0.0, 'tracking'),   # k placeholder — real k from ctx
+    (final_fn, 0.0, 'final'),
+])
+cost_fn = Constran.build(obj, constraints)
+
+# 3. MPC loop — update k every step from elite
+for step in range(T_mpc):
+    ctx['target'] = new_target
+    ctx['obs_pos'] = new_obstacles
+
+    result = solver(..., fitness_fn_total=cost_fn, context=ctx)
+
+    # Update k from the elite solution (zero extra evaluations)
+    elite_x = result.best_solution
+    ctx = update_k_from_elite(ctx, terms, elite_x, multiplier=5.0)
+```
+
+**JAX compiles once.** k values in ctx change freely — no recompilation.
+
+### 8.3 How `update_k_from_elite` Works
+
+For each term, evaluates `term_fn(elite_x, ctx)`, sets `knee = raw * multiplier`,
+then `k = 1/log(1 + knee)`.  At `multiplier=5`, the knee sits 5× ahead of the
+current best — giving the optimizer headroom while keeping the term sensitive.
+
+```
+Before (random samples):  knee=500, k=0.16  → σ(10)=0.36 (flat)
+After (elite update):     knee=50,  k=0.26  → σ(10)=0.69 (knee!)
+```
+
+### 8.4 Why Flat Costs Kill IGO Solvers
+
+When the cost landscape goes flat, the entire IGO optimization collapses
+through a causal chain:
+
+```
+cost → flat (σ'(x) → 0)
+  → argsort becomes random noise (all candidates look identical)
+    → natural gradient points in random directions
+      → GMM distribution expands without guidance
+        → samples fly to extreme values (hundreds/thousands)
+          → eig(S) → 0 or ∞  →  NaN / overflow
+```
+
+IGO relies on ranking to estimate the natural gradient. When the cost
+cannot distinguish good from bad solutions, the ranking is effectively
+random, and the gradient is pure noise. The GMM expands, samples
+diverge, and the solver **blows up**.
+
+Existing protections in `MPCsolverM22` (eigenvalue clamping at `[1e-3, 1e3]`,
+IGO weight clipping at `±20`) are **symptom treatments** — they catch the
+blow-up at the final step.  Dynamic k is a **root-cause fix**: by keeping
+every term in its knee region, the cost never goes flat, `argsort` always
+has signal, and the cascade never starts.
+
+**Experimental confirmation:** In a head-to-head comparison (500 IGO
+iterations, 12-step horizon), the cost sensitivity near the optimum was:
+
+| Approach | Cost spread near optimum | Status |
+|----------|--------------------------|--------|
+| Dynamic k | 0.0049 | Sensitive — solver sees improvement direction |
+| Static k | 0.0000 | Dead flat — solver is blind |
+| Raw weights | 0.000006 | Effectively flat — solver is blind |
+
+## 9. API Reference
 
 ### `compose_objective_adaptive(terms, *, n_dims=..., bounds=..., ..., ctx_calib=..., k_outer=1.0)`
 
@@ -327,7 +393,7 @@ Heuristic k suggestion from typical and max values.
 
 Per-term diagnostic: raw value, compressed value, saturation status.
 
-## 9. When NOT to Use
+## 10. When NOT to Use
 
 - **Single-term objective**: `build_unconstrained()` is simpler
 - **Already normalized**: if all terms are naturally in [0, 1], just sum them
@@ -335,7 +401,7 @@ Per-term diagnostic: raw value, compressed value, saturation status.
 - **Gradient-based solvers**: the sigma nesting adds nonlinearity; check if your
   gradient method tolerates it (IGO is gradient-free, so no issue)
 
-## 10. Demo
+## 11. Demo
 
 ```bash
 # Compare all three modes (no solver needed)
@@ -348,7 +414,7 @@ uv run python Functiontest/ObjectiveComposer_demo.py --optimize
 uv run python Functiontest/ObjectiveComposer_demo.py --mode composed --optimize
 ```
 
-## 11. Relationship to Constran
+## 12. Relationship to Constran
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -377,7 +443,7 @@ but at different levels: ObjectiveComposer structures the **innermost** layer
 
 ---
 
-## 12. Connection to the Small Gain Theorem
+## 13. Connection to the Small Gain Theorem
 
 The user has observed a deep structural parallel between our k-based gain control
 and the **Small Gain Theorem** (小增益理论) from nonlinear control theory.

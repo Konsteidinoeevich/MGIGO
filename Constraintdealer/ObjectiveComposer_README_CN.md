@@ -66,33 +66,33 @@ raw_knee ≈ exp(1/k) - 1
 
 ## 4. 快速入门
 
-### 4.1 基本用法
+### 4.1 推荐：自适应（语义角色）
 
 ```python
-from Constraintdealer.ObjectiveComposer import compose_objective
+from Constraintdealer.ObjectiveComposer import compose_objective_adaptive
 
-obj = compose_objective([
-    (跟踪函数,   0.5, "跟踪"),     # knee ~6.4 — 宽范围
-    (终端函数,   2.0, "终端"),     # knee ~0.65 — 精准
-    (控制函数,   1.0, "控制"),     # knee ~1.7 — 均衡
-])
+ctx_calib = {'target': jnp.array([8.0, 6.0]),
+             'init_state': jnp.array([0., 0., 0., 0.])}
+
+obj = compose_objective_adaptive([
+    (跟踪函数,   'primary',    "跟踪"),       # P50：knee 在中位数
+    (终端函数,   'secondary',  "终端"),       # P70
+    (控制函数,   'tiebreaker', "控制"),       # P95
+], n_dims=16, bounds=(-5.0, 5.0), n_samples=500,
+   ctx_calib=ctx_calib)
 # obj 是标准 (x, ctx) -> scalar 可调用对象，输出在 [0, 1)
 ```
 
-### 4.2 与 Constran.build() 集成
+### 4.2 生产级：动态 k
+
+见 [§8 动态 k](#8-动态-k免-jax-重编译)。
+
+### 4.3 与 Constran.build() 集成
 
 ```python
 from Constraintdealer.Constran import build, Deterministic
-from Constraintdealer.ObjectiveComposer import compose_objective
 
-# 步骤 1：组合目标函数
-obj = compose_objective([
-    (跟踪函数,   0.5, "跟踪"),
-    (终端函数,   2.0, "终端"),
-    (控制函数,   1.0, "控制"),
-])
-
-# 步骤 2：带上约束构建（和任何 objective_fn 一样）
+# obj 来自 compose_objective_adaptive 或 compose_objective_dynamic
 cost_fn = build(obj, [
     Deterministic(障碍函数,  mode='hard', priority=1),
     Deterministic(行人函数,  mode='hard', priority=2),
@@ -100,21 +100,6 @@ cost_fn = build(obj, [
 
 # 步骤 3：传给求解器
 result = mmog_igo_optimizer_mpc(..., fitness_fn_total=cost_fn, ...)
-```
-
-### 4.3 自动 k 模式
-
-不想手动选 k？用 `compose_objective_auto`：
-
-```python
-from Constraintdealer.ObjectiveComposer import compose_objective_auto
-
-obj = compose_objective_auto([
-    (跟踪函数,   5.0,  200.0),   # 典型值 ~5, 最大值 ~200
-    (终端函数,   0.5,  20.0),    # 典型值 ~0.5, 最大值 ~20
-    (控制函数,   1.0,  50.0),    # 典型值 ~1, 最大值 ~50
-])
-# k 由 suggest_k(典型值, 最大值) 自动计算
 ```
 
 ### 4.4 诊断各项贡献
@@ -157,18 +142,18 @@ def my_objective(z_flat, ctx):
     return f
 ```
 
-### 之后：Compose Objective
+### 之后：自适应
 
 ```python
-from Constraintdealer.ObjectiveComposer import compose_objective
+from Constraintdealer.ObjectiveComposer import compose_objective_adaptive
 
-obj = compose_objective([
-    (compute_tracking,   0.2, "跟踪"),    # knee ~147 — 纵向
-    (compute_final_error,2.0, "终端"),    # knee ~0.65 — 精准
-    (compute_smoothness, 1.0, "平滑"),    # knee ~1.7 — 均衡
-    (compute_control,    0.5, "控制"),    # knee ~6.4 — 适中
-])
-# 完成。无需权重。每个 k 基于物理含义一次性选定。
+obj = compose_objective_adaptive([
+    (compute_tracking,   'primary',    "跟踪"),    # P50 — 自动 knee
+    (compute_final_error,'secondary',  "终端"),    # P70
+    (compute_smoothness, 'tiebreaker', "平滑"),    # P95
+    (compute_control,    'tiebreaker', "控制"),    # P95
+], n_dims=16, bounds=(-5,5), n_samples=500, ctx_calib=ctx)
+# 完成。无需权重、无需 k。只需语义角色。
 # 输出始终在 [0, 1)。直接传给 Constran.build()。
 ```
 
@@ -281,23 +266,98 @@ cost_fn = build(obj, [Deterministic(obs_fn, mode='hard', priority=1)])
 # cost_fn 直接给求解器
 ```
 
-## 8. API 参考
+## 8. 动态 k：免 JAX 重编译
 
-### `compose_objective(terms, *, k_outer=1.0, jit_result=True)`
+优化过程中 cost 量级会漂移：初期 ~500，收敛后 ~10。用初期样本校准的 k
+收敛时 knee 太宽，各项掉进线性区底层——在最需要区分度的时候最不敏感。
 
-主入口。每个 term 是 `(fn, k)` 或 `(fn, k, name)`。
+**解法：k 放进 ctx，而非闭包。** ctx 本来就是动态的（MPC 每步变 target/障碍物），
+修改 ctx 里的 k 值**不会触发 JAX 重编译**。
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `terms` | tuple 列表 | 必填 | 每项 `(fn, k, name?)` |
-| `k_outer` | float | 1.0 | 最终压缩 knee |
-| `jit_result` | bool | True | 用 `jax.jit` 包装 |
+### 8.1 三个函数
 
-返回 `(x, ctx) -> scalar`，输出在 [0, 1)。
+| 函数 | 作用 |
+|------|------|
+| `calibrate_k_into_ctx(ctx, terms, ...)` | 初始校准 → 写入 `ctx['k_{name}']` |
+| `compose_objective_dynamic(terms)` | 构建从 ctx 读取 k 的 cost fn |
+| `update_k_from_elite(ctx, terms, elite_x)` | 用精英解更新 k（knee = 原始值×5） |
 
-### `compose_objective_auto(terms, *, k_outer=1.0, jit_result=True)`
+### 8.2 MPC 循环模式
 
-从典型值和最大值自动推荐 k。每项是 `(fn, typical, max_or_None)`。
+```python
+from Constraintdealer.ObjectiveComposer import (
+    compose_objective_dynamic, calibrate_k_into_ctx, update_k_from_elite
+)
+
+# 1. 初始校准（一次）
+ctx = calibrate_k_into_ctx(ctx, [
+    (跟踪函数, 'primary',    '跟踪'),
+    (终端函数, 'secondary',  '终端'),
+], n_dims=16, bounds=(-5,5), n_samples=500)
+
+# 2. 构建代价函数（一次）
+obj = compose_objective_dynamic([
+    (跟踪函数, 0.0, '跟踪'),    # k 占位——真正的 k 从 ctx 读取
+    (终端函数, 0.0, '终端'),
+])
+cost_fn = Constran.build(obj, constraints)
+
+# 3. MPC 循环——每步用精英更新 k
+for step in range(T_mpc):
+    ctx['target'] = new_target
+    ctx['obs_pos'] = new_obstacles
+
+    result = solver(..., fitness_fn_total=cost_fn, context=ctx)
+
+    # 用精英解更新 k（零额外评估）
+    elite_x = result.best_solution
+    ctx = update_k_from_elite(ctx, terms, elite_x, multiplier=5.0)
+```
+
+**JAX 编译一次。** ctx 里的 k 值自由变化——不触发重编译。
+
+### 8.3 `update_k_from_elite` 如何工作
+
+对每项，在精英解上评估 `term_fn(elite_x, ctx)`，设 `knee = raw * multiplier`，
+然后 `k = 1/log(1 + knee)`。`multiplier=5` 时，knee 在当前最佳值 5 倍处——
+给优化留改善空间，同时保持敏感度。
+
+```
+更新前（随机样本校准）: knee=500, k=0.16  → σ(10)=0.36（平坦）
+更新后（精英校准）:     knee=50,  k=0.26  → σ(10)=0.69（knee区！）
+```
+
+### 8.4 为什么 cost 平坦会杀死 IGO 求解器
+
+当 cost 地形趋于平坦，整个 IGO 优化会通过一条因果链崩溃：
+
+```
+cost 变平坦（σ'(x) → 0）
+  → argsort 变成随机噪声（所有候选看起来一样好/差）
+    → 自然梯度指向随机方向
+      → GMM 分布无引导地膨胀扩散
+        → 采样飞到极端值（几百上千）
+          → eig(S) → 0 或 ∞  →  NaN / 溢出
+```
+
+IGO 依赖排序来估计自然梯度。当 cost 无法区分好坏解时，排序等同于随机，
+梯度是纯噪声。GMM 膨胀，采样发散，求解器**崩溃**。
+
+`MPCsolverM22` 中现有的保护措施（特征值 clamp `[1e-3, 1e3]`、
+IGO 权重 clip `±20`）是**治标的止血带**——只在最后一步拦截崩溃。
+动态 k 是**治本**：让各项始终处于 knee 区，cost 永不平坦，
+`argsort` 始终有信号，整条链根本不会启动。
+
+**实验确认：** 在 500 次 IGO 迭代、12 步 horizon 的对比测试中，
+最优解附近的 cost 敏感度为：
+
+| 方案 | 最优解附近敏感度 | 状态 |
+|------|-----------------|------|
+| 动态 k | 0.0049 | 敏感——求解器能看到改进方向 |
+| 静态 k | 0.0000 | 彻底平坦——求解器"瞎了" |
+| 原始权重 | 0.000006 | 基本平坦——求解器"瞎了" |
+
+## 9. API 参考
 
 ### `compose_objective_adaptive(terms, *, n_dims=..., bounds=..., ..., ctx_calib=..., k_outer=1.0)`
 
@@ -321,14 +381,14 @@ cost_fn = build(obj, [Deterministic(obs_fn, mode='hard', priority=1)])
 
 逐项诊断：原始值、压缩值、饱和状态。
 
-## 9. 不适用的情况
+## 10. 不适用的情况
 
 - **单项目标**：用 `build_unconstrained()` 更简单
 - **已经归一化**：如果所有项本来就自然落在 [0, 1]，直接求和即可
 - **已知固定权重**：如果权重已经调好且工作正常，保持原样
 - **基于梯度的求解器**：sigma 嵌套增加了非线性，请检查梯度方法是否容忍（IGO 无梯度，无此问题）
 
-## 10. Demo
+## 11. Demo
 
 ```bash
 # 对比三种模式（不需要求解器）
@@ -341,7 +401,7 @@ uv run python Functiontest/ObjectiveComposer_demo.py --optimize
 uv run python Functiontest/ObjectiveComposer_demo.py --mode composed --optimize
 ```
 
-## 11. 与 Constran 的关系
+## 12. 与 Constran 的关系
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -369,7 +429,7 @@ ObjectiveComposer 结构化**最内层**（目标函数），Constran 结构化*
 
 ---
 
-## 12. 与小增益定理的联系
+## 13. 与小增益定理的联系
 
 我们基于 k 的增益控制与非线性控制理论中的**小增益定理**（Small Gain Theorem）
 有深刻的结构平行。本节形式化这一联系。

@@ -161,6 +161,17 @@ eliminating numeric explosion regardless of raw magnitude.
 **Design rule**: Hard outside, Soft inside. For deep nests, $\delta$ adapts
 automatically ($\sigma_1^{(n)}(1) = 1/\sqrt{n+1}$).
 
+**Dynamic sensitivity** (see [ObjectiveComposer_README.md](Constraintdealer/ObjectiveComposer_README.md) and [ConstraintsTransformation_README.md §11](Constraintdealer/ConstraintsTransformation_README.md)):
+- **Dynamic k**: objective sub-terms get per-term `sigma_k(..., k)` with k
+  auto-calibrated from elite solutions. Prevents flat-cost collapse as the
+  optimizer converges toward the optimum. JAX compiles once — k lives in ctx.
+- **Dynamic γ**: hard constraints get `T(g) * gamma` where `gamma = δ/T(g_best)`
+  is updated from the elite after each solver call. Prevents the δ offset from
+  drowning out small violation signals. Sigma bounds cost to [0,1] regardless
+  of gamma magnitude.
+- Both use the same zero-recompilation mechanism: parameter in ctx, updated
+  between solver calls.
+
 ### 3.3 Three-Step Usage
 
 ```python
