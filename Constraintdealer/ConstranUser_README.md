@@ -47,36 +47,93 @@ result = mmog_igo_optimizer_mpc(..., fitness_fn_total=cost_fn, context=ctx)
 
 ---
 
-## 2. 四种约束类型
+## 2. 四种约束类型 + 内置聚合
 
 | 类型 | 你写 | Constran 自动计算 g_raw |
 |------|------|----------------------|
-| `Deterministic` | `max(0, g(x))` | 直接 |
-| `Chance` | `g(x, ξ)` + 噪声分布 | $Q_{1-\alpha}(g(x,\xi))$ MC 分位数 |
-| `Robust` | `g(x, ξ)` + 不确定性集 Ξ | $\max_{\xi\in\Xi} g(x,\xi)$ lax.scan |
-| `DRO` | `g(x, ξ)` + 模糊集 $\{P_k\}$ | $\max_{P_k} Q_{1-\alpha}^{P_k}(g)$ |
+| `Deterministic` | `g(x)`（标量或向量） | `aggregate` 聚合 → 标量 |
+| `Chance` | `g(x, ξ)` + 噪声分布 | 聚合 → $Q_{1-\alpha}$ |
+| `Robust` | `g(x, ξ)` + 不确定性集 Ξ | 聚合 → $\max_{\Xi}$ |
+| `DRO` | `g(x, ξ)` + 模糊集 | 聚合 → $\max_P Q_{1-\alpha}$ |
+
+### 内置聚合 `aggregate`
+
+**轨迹上每个采样点的违反构成一个向量。** 用 `aggregate` 指定聚合方式，
+无需在 `g_fn` 里手写 `sum`/`mean`：
 
 ```python
-# Deterministic
-Deterministic(lambda x, ctx: jnp.maximum(0.0, x[0]**2 + x[1]**2 - 25),
-              mode='hard', priority=1)
+# g_fn 直接返回每步的穿透向量, Constran 帮你聚合
+Deterministic(
+    lambda x, ctx: jnp.maximum(0.0, safe_dist - min_dists(x, ctx)),  # (H,) 向量
+    aggregate='sum',    # 总穿透量 (默认)
+    mode='soft', priority=1,
+)
 
-# Chance: P(g(x,ξ) ≤ 0) ≥ 1-α
-Chance(lambda x, xi, ctx: jnp.linalg.norm(x[:2] + xi) - 3.0,
-       noise_fn=lambda key, shape: jax.random.normal(key, shape) * 0.2,
-       alpha=0.1, n_samples=100,
-       mode='tunable', priority=2, tune_preset='firm')
+Deterministic(
+    lambda x, ctx: jnp.maximum(0.0, safe_dist - min_dists(x, ctx)),
+    aggregate='mean',   # 平均穿透, 与时域长度无关
+    mode='soft', priority=1,
+)
+```
 
-# Robust: ∀ξ∈Ξ
-Robust(lambda x, xi, ctx: (x[0] + xi)**2 + x[1]**2 - 10,
-       uncertainty_set=jnp.concatenate([
-           jnp.linspace(-3.0, -2.0, 20), jnp.linspace(1.0, 2.0, 20)]),
-       mode='hard', priority=1)
+| aggregate | 语义 | 适用 |
+|-----------|------|------|
+| `'sum'`（默认） | 总违反量 | "全程擦边比单点碰撞差" |
+| `'mean'` | 平均每步违反 | "只看步均, 与时域长度无关" |
+| `'max'` | 最危险的一步 | "不允许任何一步超出极限" |
+| `'count'` | 违反步数 | "广度比深度重要" |
+| `'q90'`, `'q95'`, `'q99'` | 分位数 | "允许 10%/5%/1% 的采样点违规" |
 
-# DRO
-DRO(lambda x, xi, ctx: g(x, xi),
-    ambiguity_set=[noise_fn_1, noise_fn_2, noise_fn_3],
-    alpha=0.1, mode='hard', priority=1)
+### 聚合方式怎么选
+
+**先问自己：这个约束是在管"总体"还是管"最坏"？**
+
+| 约束类型 | 推荐聚合 | 原因 |
+|---------|---------|------|
+| **避障/碰撞** | `max` 或 `q95` | 安全性由最危险的点决定。`max`=一个点都不行，`q95`=允许 5% 点擦边 |
+| **能耗/燃料** | `sum` | 总消耗量，累加才有意义 |
+| **跟踪误差** | `mean` | 平均偏离，与时域长度解耦 |
+| **曲率/平滑** | `mean` 或 `q90` | 整体舒适度，允许偶尔急转 |
+| **速度/加速度限制** | `max` | 任何一步超限就是违规 |
+| **终端约束** | 不加聚合（单点） | 只看最后一步 |
+
+**分位数 `q95` 的空间含义**（不是概率！是对轨迹采样点排序）：
+
+```python
+# B-spline 200 采样点, q95 表示:
+#   排序后取第 190 个（95%）, 允许 10 个最差的点被忽略
+#   适合: 拐角处偶尔擦边可以忍, 但 95% 的轨迹必须是安全的
+
+Deterministic(
+    lambda x, ctx: jnp.maximum(0.0, safe_dist - min_dists(x, ctx)),
+    aggregate='q95',   # 200 点中允许 10 点擦边
+    mode='hard', priority=1,
+)
+```
+
+**典型 B-spline 配置：**
+
+```python
+constraints = [
+    # 碰撞: max — 最危险点决定安全
+    Deterministic(collision_pen, aggregate='max', mode='hard', priority=1),
+    # 曲率: mean — 整体平滑度
+    Deterministic(curvature_pen, aggregate='mean', mode='soft', priority=2),
+    # 速度: max — 不能有任何一步超速
+    Deterministic(speed_pen, aggregate='max', mode='hard', priority=3),
+]
+```
+
+**对比: sum vs max vs mean vs q95（同一个 B-spline 200 点轨迹）**
+
+```
+每点穿透: 180点擦0.01 + 10点碰0.5 + 10点撞2.0
+
+sum=0.61:   全过程总穿透 → 最敏感，擦边也被放大
+mean=0.11:  平均每步 → 与轨迹长度无关
+max=0.33:   只看最危险点 → 2.0m 那一步决定一切
+q95=0.17:   忽略最差的 10 个点 → 介于 mean 和 max 之间
+count=0.76: 只看违规点数 → 200 点中 20 点违规
 ```
 
 ---

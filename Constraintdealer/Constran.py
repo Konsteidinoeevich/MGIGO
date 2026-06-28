@@ -36,24 +36,25 @@ import warnings
 
 # 约束预设
 # === 工程标定的三档变换表 ===
-# Soft:  g < 0.01 可容忍 → T ≈ 0.02~0.15,  之后渐升
-# Tunable: g < 0.01 明显感知 → T ≈ 0.2~0.65
-# Hard:    g → 0⁺ 立刻惩罚 → 地板 0.6+
+# 第一个 knot 的 g 值 = 该模式的"分辨率"
+# Soft:  分辨率 1e-2, 地板 T=0.03 — g<0.01 几乎无感
+# Tunable: 分辨率 1e-4, 地板 T=0.2  — g<1e-4 几乎无感, 但有 σ 压缩兜底
+# Hard:  分辨率 1e-6, 地板 T=0.6  — g<1e-6 立刻感知
 
 TRANSFORM_SOFT = (
-    np.array([1e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 0.5, 1, 10, 100, 1e4, 1e6]),
-    np.array([0.02, 0.05, 0.1,  0.15, 0.25, 0.4,  0.7, 1.2, 2.5, 4.5,  8.0, 12.0]),
-)  # 地板 0.02, g=0.01→T=0.15(轻触), g=0.1→T=0.4(感知)
+    np.array([1e-2, 5e-2, 1e-1, 0.5, 1, 10, 100, 1e4, 1e6]),
+    np.array([0.03, 0.08, 0.2,  0.5, 1.0, 2.5, 5.0,  9.0, 13.0]),
+)  # 分辨率 1e-2: g<0.01→T=0.03(无感), g=0.01→T=0.03(刚感知)
 
 TRANSFORM_TUNABLE = (
-    np.array([1e-6, 1e-4, 1e-3, 1e-2, 0.1, 0.5, 1, 10, 100, 1e4, 1e6]),
-    np.array([0.2,  0.35, 0.5,  0.65, 0.9, 1.3, 1.8, 3.0, 5.5,  9.0, 13.0]),
-)  # 地板 0.2, g=0.01→T=0.65(明显), g=1e-4→T=0.35(可感)
+    np.array([1e-4, 1e-3, 1e-2, 0.1, 0.5, 1, 10, 100, 1e4, 1e6]),
+    np.array([0.15, 0.25, 0.4,  0.7, 1.0, 1.5, 3.0, 5.5,  9.0, 13.0]),
+)  # 分辨率 1e-4: g<1e-4→T=0.15(微感), g=0.01→T=0.4(明显)
 
 TRANSFORM_HARD = (
-    np.array([1e-8, 1e-6, 1e-4, 1e-3, 1e-2, 0.1, 1, 10, 100, 1e4, 1e6]),
-    np.array([0.6,  0.75, 0.9,  1.1,  1.4,  1.8, 2.5, 4.0, 7.0, 10.0, 13.0]),
-)  # 地板 0.6, g=1e-6→T=0.75(立刻重罚)
+    np.array([1e-6, 1e-4, 1e-3, 1e-2, 0.1, 1, 10, 100, 1e4, 1e6]),
+    np.array([0.5,  0.7,  0.9,  1.2,  1.6, 2.5, 4.0, 7.0, 10.0, 13.0]),
+)  # 分辨率 1e-6: g<1e-6→T=0.5(感知), g=1e-4→T=0.7(明显)
 
 # 保留别名
 TRANSFORM_STANDARD = TRANSFORM_TUNABLE  # 'standard' → Tunable 标定
@@ -222,6 +223,7 @@ class ConstraintSpec:
     tune_preset: str = 'none'               # preset for (β, δ_soft), or 'none'
     transform: str = ''  # '' = auto-detect from mode
     _transform_table: Optional[Tuple] = None
+    aggregate: str = ''  # '' = sum/identity; 'mean','max','q90','q95','q99','count'
 
     def __post_init__(self):
         # Normalize: 'hard' → 'tunable' with extreme β
@@ -315,19 +317,48 @@ class DRO(ConstraintSpec):
 # 3. Violation Function Builders (unchanged)
 # ===========================================================================
 
+def _wrap_aggregate(g_fn, agg: str):
+    """Wrap g_fn with aggregation.  g_fn returns vector or scalar."""
+    if not agg or agg in ('sum', 'identity', ''):
+        return lambda x, ctx: jnp.sum(g_fn(x, ctx))  # sum handles both vector & scalar
+    if agg == 'mean':
+        return lambda x, ctx: jnp.mean(g_fn(x, ctx))
+    if agg == 'max':
+        return lambda x, ctx: jnp.max(g_fn(x, ctx))
+    if agg == 'count':
+        return lambda x, ctx: jnp.sum(g_fn(x, ctx) > 0.0)
+    if agg.startswith('q'):
+        q = float(agg[1:]) / 100.0  # 'q90' → 0.9, 'q95' → 0.95
+        return lambda x, ctx: jnp.quantile(g_fn(x, ctx), q)
+    raise ValueError(f"Unknown aggregate: {agg!r}. Use 'sum','mean','max','count','q90','q95','q99'.")
+
+
 def _make_violation_fn(spec: ConstraintSpec) -> Callable:
+    """Build a violation function (x, ctx) -> g_raw for one constraint."""
+    agg = spec.aggregate
+
     if isinstance(spec, Deterministic):
-        return spec.g_fn
+        raw_fn = spec.g_fn
+        return _wrap_aggregate(raw_fn, agg) if agg else raw_fn
+
     elif isinstance(spec, Chance):
-        g_fn, noise_fn, alpha, M = spec.g_fn, spec.noise_fn, spec.alpha, spec.n_samples
+        g_fn = spec.g_fn
+        if agg: g_fn = _wrap_aggregate(g_fn, agg)
+        noise_fn = spec.noise_fn
+        alpha = spec.alpha
+        M = spec.n_samples
         def chance_violation(x, ctx):
             key = random.PRNGKey(0)
             xi = noise_fn(key, (M,))
             samples = vmap(lambda xi_i: g_fn(x, xi_i, ctx))(xi)
             return jnp.quantile(samples, 1.0 - alpha)
         return chance_violation
+
     elif isinstance(spec, Robust):
-        g_fn, uset, N = spec.g_fn, spec.uncertainty_set, spec.n_grid
+        g_fn = spec.g_fn
+        if agg: g_fn = _wrap_aggregate(g_fn, agg)
+        uset = spec.uncertainty_set
+        N = spec.n_grid
         if callable(uset): xi_all = uset(N)
         else: xi_all = jnp.asarray(uset)
         def robust_violation(x, ctx):
@@ -336,8 +367,13 @@ def _make_violation_fn(spec: ConstraintSpec) -> Callable:
             worst, _ = lax.scan(body, -jnp.inf, xi_all)
             return worst
         return robust_violation
+
     elif isinstance(spec, DRO):
-        g_fn, amb_set, alpha, M_per = spec.g_fn, spec.ambiguity_set, spec.alpha, spec.n_samples_per_dist
+        g_fn = spec.g_fn
+        if agg: g_fn = _wrap_aggregate(g_fn, agg)
+        amb_set = spec.ambiguity_set
+        alpha = spec.alpha
+        M_per = spec.n_samples_per_dist
         def dro_violation(x, ctx):
             worst_q = -jnp.inf
             for noise_fn in amb_set:
@@ -348,6 +384,7 @@ def _make_violation_fn(spec: ConstraintSpec) -> Callable:
                 worst_q = jnp.maximum(worst_q, q)
             return worst_q
         return dro_violation
+
     else:
         raise TypeError(f"Unknown constraint type: {type(spec)}")
 

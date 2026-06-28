@@ -28,7 +28,7 @@ from jax import random, lax, jit, vmap
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gmm_igo.MPCsolverM22 import mmog_igo_optimizer_mpc
-from Constraintdealer.Constran import build, Deterministic
+from Constraintdealer.Constran import build, Deterministic, log_transform
 from Constraintdealer.ObjectiveComposer import (
     compose_objective_dynamic, compose_objective_semantic,
     compose_objective_adaptive,
@@ -604,103 +604,69 @@ def mpc_cost_fn_composed(z_flat, ctx):
 
 
 # ======================================================================
-# 5e. Semantic mode: T_alpha + fixed k for BOTH objective and constraints
+# 5e. Semantic mode: log_transform per term + build() for constraints
 #
-#     Direct nesting — no build(), no double T_alpha.
-#     Every channel uses the same gain structure:
-#       T_alpha(raw) → σ(k=0.2)
+#     Objective: log_transform per term → sum (no σ, no floor)
+#     Constraints: build() with mode='hard' — proven nesting structure
 #
-#     Nesting (inside-out):
-#       L3 = σ( Σ_i σ(T_alpha(obj_term_i), k=0.2), k=0.2 )
-#       L2 = σ( δ·σ(β·T_alpha(dynamic_viol)), k=0.2) + L3 ), k=0.2 )
-#       L1 = σ( δ·σ(β·T_alpha(static_viol)),  k=0.2) + L2 ), k=0.2 )
-#
-#     One table, one k, zero parameters.
+#     log_transform preserves magnitude ordering without a floor:
+#       far:  log(1000) dominates log(2)    → "go to target"
+#       near: log(10) dominates log(0.01)   → "stay efficient"
+#     Natural transition.  No weights.  No normalization.
 # ======================================================================
 
-from Constraintdealer.Constran import (
-    T_alpha, sigma_k, log_transform,
-    CONSTRAINT_KNOTS_G, CONSTRAINT_KNOTS_T,
+def _semantic_objective(z_flat, ctx):
+    """Auto-derived structural factors + log_transform per term → sum.
+
+    Factors derived from MPC structure (not tuned):
+      - final = H (one-step error counts as much as whole horizon)
+      - control = 1 / (H * max_force²) (normalize to position-error scale)
+    log_transform = sign(x)·log(1+|x|) handles magnitude compression.
+    """
+    traj = ctx['traj']
+    final_state = ctx['final_state']
+    target = ctx['target']
+    H = z_flat.shape[0] // 2
+    u_max = CONFIG['max_force']
+    positions = traj[:, :2]
+
+    tracking_raw = jnp.sum(jnp.sum((positions - target[None, :]) ** 2, axis=1))
+    final_raw = float(H) * jnp.sum((final_state[:2] - target) ** 2)
+    fx = u_max * jnp.tanh(z_flat[:H])
+    fy = u_max * jnp.tanh(z_flat[H:2*H])
+    control_raw = (1.0 / (H * u_max**2)) * (jnp.sum(fx ** 2) + jnp.sum(fy ** 2))
+
+    return (log_transform(tracking_raw) +
+            log_transform(final_raw) +
+            log_transform(control_raw))
+
+
+# build() handles constraint nesting, T_alpha compression, and σ layering
+_semantic_cost_base = build(
+    _semantic_objective,
+    [
+        Deterministic(_static_violation, mode='hard', priority=1),
+        Deterministic(_dynamic_violation, mode='hard', priority=2),
+    ],
+    jit_cost=False,
 )
-
-# Per-term transform for objectives: log_transform (NO floor).
-# T_alpha's floor is essential for constraints (tiny violation → detect),
-# but harmful for objectives (tiny error → artificially inflated to floor).
-# log_transform naturally lets the dominant term emerge at each stage.
-def _obj_channel(raw):
-    """log_transform — goes to 0 at raw=0.  Natural emergence, no floor."""
-    return log_transform(raw)
-
-def _constraint_channel(g_raw, kg=CONSTRAINT_KNOTS_G, kT=CONSTRAINT_KNOTS_T,
-                        beta=1.0, delta=0.5, k_sat=0.2):
-    """Tunable constraint: δ · σ(β · T_alpha(g), k=1)  →  σ(contrib + inner, k=k_sat)."""
-    return delta * sigma_k(beta * T_alpha(g_raw, kg, kT))
 
 
 @jit
 def mpc_cost_fn_semantic(z_flat, ctx):
-    """Semantic MPC cost — unified T_alpha + k=0.2 for all channels.
-
-    Direct nesting: objective terms and constraint violations all go through
-    the same T_alpha → σ(k=0.2) pipeline.  No double transform.
-    """
     (init_state, target, dt_val, _,
      ped1_traj, ped1_r, ped1_sigma, mc_key) = ctx
     H = z_flat.shape[0] // 2
-    u_max = CONFIG['max_force']
-
     theta_x = z_flat[:H]
     theta_y = z_flat[H:2 * H]
     traj, final_state, _ = _rollout(theta_x, theta_y, init_state, dt_val, H)
-    positions = traj[:, :2]
 
-    # ── Objective terms (same gain: T_alpha → σ(k=0.2)) ──
-    dists = jnp.sum((positions - target[None, :]) ** 2, axis=1)
-    tracking_raw = jnp.sum(dists)
-    final_raw = 15.0 * jnp.sum((final_state[:2] - target) ** 2)
-    fx_a = u_max * jnp.tanh(theta_x)
-    fy_a = u_max * jnp.tanh(theta_y)
-    control_raw = 0.1 * (jnp.sum(fx_a ** 2) + jnp.sum(fy_a ** 2))
-
-    # log_transform per term (no floor), sum, THEN σ.
-    # Dominant term emerges naturally from data magnitude at each stage:
-    #   far: tracking dominates → go fast
-    #   near: control dominates → smooth arrival
-    obj_transformed = (_obj_channel(tracking_raw) +
-                       _obj_channel(final_raw) +
-                       _obj_channel(control_raw))
-    inner = sigma_k(obj_transformed, k=0.1)   # L3: wide knee — preserve objective range
-
-    # ── L2 constraint: dynamic pedestrian ──
-    safe_margin = 0.05
-    ped_safe_dist = ped1_r + safe_margin
-    diff_to_ped = positions - ped1_traj
-    M = CHANCE_MC
-    noise = random.normal(mc_key, (M, 2)) * ped1_sigma
-    def noisy_dist(ns):
-        return jnp.sqrt(jnp.sum((diff_to_ped - ns[None, :]) ** 2, axis=-1) + 1e-12)
-    dist_noisy = vmap(noisy_dist)(noise)
-    q_dist = jnp.quantile(dist_noisy, 1.0 - CHANCE_PROB, axis=0)
-    viol_dynamic = jnp.sum(jnp.where(
-        ped_safe_dist - q_dist > 0.0, 1.5 + ped_safe_dist - q_dist, 0.0))
-
-    c2 = _constraint_channel(viol_dynamic)
-    inner = sigma_k(c2 + inner, k=0.2)   # L2: outer σ — detectability for constraints
-
-    # ── L1 constraint: static obstacles + bounds ──
-    viol_static = jnp.sum(vmap(
-        lambda p: _static_obstacle_violation(p[0], p[1]))(positions))
-    viol_bound = jnp.sum(
-        jnp.where(positions[:, 0] < 0.0, 1.5 - positions[:, 0], 0.0) +
-        jnp.where(positions[:, 0] > 9.5, 1.5 + positions[:, 0] - 9.5, 0.0) +
-        jnp.where(positions[:, 1] < 0.0, 1.5 - positions[:, 1], 0.0) +
-        jnp.where(positions[:, 1] > 8.0, 1.5 + positions[:, 1] - 8.0, 0.0))
-    viol_static = viol_static + viol_bound
-
-    c1 = _constraint_channel(viol_static)
-    inner = sigma_k(c1 + inner, k=0.2)   # L1: outer σ — same
-
-    return inner
+    ext_ctx = {
+        'traj': traj, 'final_state': final_state, 'target': target,
+        'ped_traj': ped1_traj, 'ped_r': ped1_r, 'ped_sigma': ped1_sigma,
+        'mc_key': mc_key,
+    }
+    return _semantic_cost_base(z_flat, ext_ctx)
 
 
 # Default: use the original jnp.where version

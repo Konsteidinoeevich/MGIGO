@@ -137,19 +137,29 @@ $$
 
 $g=10^{-10}$ 和 $g=10^{-7}$ 输出**相同**的 $T=0.7$——这就是"地板"。它保证了任何非零违反都能被感知（$\sigma(0.7) \approx 0.57 \gg 0$），消灭了 $\log(1+x) \approx x \approx 0$ 造成的盲区。
 
-#### 预设表（约束）
+#### 三档分辨率标定
 
-| 预设 | 地板 $T(g\to 0^+)$ | 含义 |
-|------|-------------------|------|
-| `'tight'` | 0.3 | 近 log，但无盲区 |
-| `'standard'` | 0.7 | **默认** |
-| `'sharp'` | 1.0 | 小违反立即重罚 |
-| `'wide'` | 0.3 | 宽线性区，适合偏好 |
-| `'log'` | 0（无地板） | 原版 log_transform |
+**第一个 knot 的 $g$ 值 = 该模式的"分辨率"。** 小于此值的违反全在地板区——求解器几乎无感。
 
-**预设表（目标）：** `'standard'`（默认），`'flat'`（更平），`'log'`。
+| 模式 | 分辨率 | 地板 T | 语义 |
+|------|--------|--------|------|
+| **Soft** | $10^{-2}$ | 0.03 | $g<0.01$ 几乎无感，目标和约束平等竞争 |
+| **Tunable** | $10^{-4}$ | 0.15 | $g<10^{-4}$ 微感，σ 压缩兜底 |
+| **Hard** | $10^{-6}$ | 0.50 | $g<10^{-6}$ 立即感知，任何违反 > 任何满足 |
 
-每层约束可以独立选择 `transform`，也可以自定义结点表。
+```
+       g=0   1e-6  1e-4  1e-3  0.01   0.1    1     10
+Soft:  .044  .050  .050  .050  .050  .084  .237  .478
+Tun:   .044  .053  .053  .059  .068  .085  .125  .175
+Hard:  .044  .129  .129  .175  .225  .277  .312  .322
+```
+
+- **Soft** 在 $g<0.01$ 区间完全平坦——$g=0$ 和 $g=0.005$ 代价相同。$g=0.1$ 才开始抬头。
+- **Tunable** 在 $g<10^{-4}$ 平坦，$g=0.01$ 时有明显惩罚（0.068 vs 0.044），但有 σ 压缩。
+- **Hard** 在 $g<10^{-6}$ 平坦，$g=10^{-6}$ 就跳到 0.129——任何微小违反代价都远超无违反最大值（0.133 vs 0.129...实际在最坏目标下 0.215 > 0.133，分离保证）。
+
+**调分辨率：改第一个 knot 的 $g$ 值。** 调地板高度：改第一个 $T$ 值。
+详见 [§2.3 怎么调整容忍度](#23-三档默认标定与时域累加)。
 
 ### 2.3 三档默认标定与时域累加
 
@@ -474,202 +484,3 @@ Soft 等于 Tunable 取 β→0, δ→∞ 的极限——对数增长永不饱和
 
 ---
 
-## 11. 动态 Gamma — 硬约束的敏感度保持
-
-### 11.1 问题：硬约束在违反区内 cost 平坦
-
-硬约束公式 `σ(T(g) + δ)` 中，δ=1.5 是固定的。当违反 g 很小时，
-T(g) ≪ δ，δ 压倒了违反信号：
-
-```
-g=100: T(g)=4.6 → σ(6.1)=0.987
-g=1:   T(g)=0.69 → σ(2.19)=0.910
-g=0.1: T(g)=0.095 → σ(1.60)=0.847
-g=0.01: T(g)=0.010 → σ(1.51)=0.834  ← δ 完全压制 T(g)
-g=0.001:T(g)=0.001 → σ(1.50)=0.832  ← 和 g=0.01 几乎没区别
-```
-
-在 g∈[0.001, 0.1] 区间，cost 变化量仅 ~0.015。求解器在这段违反区内"瞎了"——分不清
-微小违反和较大违反，找不到回可行域的方向。
-
-### 11.2 解法：动态 γ = δ / T(g_best)
-
-在违反项前加一个来自 ctx 的缩放因子：
-
-```
-σ( T(g) · γ + δ + inner )
-```
-
-每次求解器收敛后，从精英解（当前最好的解）上评估违反值 g_best，计算：
-
-```
-γ = δ / T(g_best)
-```
-
-这样 T(g_best)·γ = δ —— 最优违反的贡献恰好等于偏移量。无论违反多小。
-
-```
-g_best=100: γ=0.32 → T(0.1)*γ=0.03  (大违反时 γ 小，不放大)
-g_best=0.1: γ=15.7 → T(0.1)*γ=1.50  (小违反时 γ 大，放大到和 δ 同级)
-g_best=0.01: γ=150 → T(0.01)*γ=1.50  (始终把贡献拉到 δ 量级)
-```
-
-灵敏度对比（g_best=0.05）：
-
-| g | 固定 γ=1 | 动态 γ=30.7 |
-|---|----------|------------|
-| 0.2 | σ=0.860（平坦）| σ=0.990（敏感）|
-| 0.1 | σ=0.847（平坦）| σ=0.975（敏感）|
-| 0.05 | σ=0.840（平坦）| σ=0.949（knee区）|
-| 0.03 | σ=0.837（平坦）| σ=0.924（knee区）|
-| Δσ | 0.023 | 0.066（3x 更敏感）|
-
-### 11.3 API：build_dynamic + update_gamma_from_elite
-
-```python
-from Constraintdealer.Constran import build_dynamic, Deterministic, update_gamma_from_elite
-
-# 构建 — 和 build() 完全相同的接口
-constraints = [
-    Deterministic(viol_obstacle, mode='hard', priority=1),
-    Deterministic(viol_pedestrian, mode='hard', priority=2),
-]
-cost_fn = build_dynamic(objective_fn, constraints)
-
-# MPC 循环
-for step in range(T_mpc):
-    # gamma 默认 1.0 — 安全，等同于 build()
-    result = solver(..., fitness_fn_total=cost_fn, context=ctx)
-
-    # 更新 gamma 为下一步准备
-    elite_x = extract_best(result)
-    ctx = update_gamma_from_elite(
-        ctx,
-        [(viol_obstacle, 1), (viol_pedestrian, 2)],  # (viol_fn, priority)
-        elite_x,
-    )
-```
-
-**关键属性**：
-- gamma 默认 = 1.0（ctx 里没有 key 也正常工作，无需 calibrate）
-- `update_gamma_from_elite` 每次从 scratch 重算（不依赖旧值，无需 reset）
-- gamma 在 ctx 里 → 不触发 JAX 重编译
-- Sigma 限幅：无论 γ 多大，cost ≤ 1.0
-
-### 11.4 为什么单靠 log_transform 不够
-
-log_transform 压缩了量级但保序——T(0.1)=0.095 > T(0.01)=0.010，是对的。
-问题是 **δ=1.5 这个固定偏移量**。T(g)+δ 中 δ 的占比随着 g→0 趋于 100%，
-"违反信号 / 総输入" 趋近于零。不是 log_transform 的问题，是加法结构的问题。
-γ 修复了这个结构性问题。
-
-### 11.5 与动态 k 的互补
-
-| 参数 | 控制什么 | 防止什么 |
-|------|---------|---------|
-| 动态 k (objective) | objective 在 sigma 中的 knee 位置 | objective 量级漂移导致平坦 |
-| 动态 γ (hard constraint) | 违反贡献相对于 δ 的比例 | δ 固定导致违反区平坦 |
-
-两者都不触发 JAX 重编译。见 ObjectiveComposer_README.md §8。
-
-### 11.6 软约束不需要动态 γ
-
-软约束 `σ(T(g) + σ(T(f), k_obj))` 中没有 δ 偏移——T(g) 直接参与加性竞争。
-只要 objective 的动态 k 保证 σ(T(f)) 不饱和，余量就足以接收 T(g)。
-框架给了你全套积木，语义你自己定。
-
----
-
-## 12. Constran — 多段 α 变换（无动态追踪）
-
-### 12.1 动机：消除对求解器输出的依赖
-
-动态 gamma 和动态 k 虽然有效，但依赖精英解追踪——存在三个问题：
-1. **自循环**：精英解质量影响 k/gamma，k/gamma 反过来影响精英解
-2. **噪音大**：精英解的 term 值在优化初期极不稳定
-3. **评估成本高**：每次更新都要用校准函数重算轨迹
-
-**根本解法：改造变换函数本身。** 如果 `T(x)` 的输出本身就落在 sigma 的敏感区，
-就不需要事后修正。
-
-### 12.2 分段 T 变换
-
-标准对数变换 `T(x) = sign(x)·log(1+|x|)` 的问题是：小输入 T≈x（趋向 0，弱信号），
-大输入 T≈log|x|（过压缩）。分段 T 直接定义目标输出值：
-
-```
-T(x) = sign(x) · T_target(|x|)
-```
-
-`T_target` 是在 log|x| 空间分段线性插值的函数，通过 knot 表定义。
-小 x 时 T_target 保持常数 → **真正的地板**，不随 x→0 而衰减。
-大 x 时 T_target ≈ log|x| → 退回标准对数行为。
-
-| \|x\| 范围 | T_target | 含义 |
-|---------|----------|------|
-| ~1e-6 | 0.7 | 地板——极微小值保持 T≈0.7 |
-| ~1e-4 | 0.8 | 地板区 |
-| ~1e-2 | 0.9 | 过渡 |
-| ~1e-1 | 1.0 | 接近标准 log |
-| ~1e0 | 1.5 | 标准 log 区域 |
-| ~1e1 | 2.5 | 轻度放大 |
-| ~1e2 | 4.0 | 标准压缩 |
-| ~1e4 | 7.0 | 大值压缩 |
-| ~1e6 | 10.0 | 极大值压缩 |
-
-knot 之间通过 log(|x|) 线性插值 T_target 实现平滑过渡。
-
-### 12.3 效果
-
-δ=1.0 配合多段 α，违反值从 1e-6 到 1e6 跨越 12 个数量级，
-σ 始终稳定在 [0.71, 0.97]：
-
-```
-g=1e-06: T=0.010  σ=0.711  ✓ knee区
-g=1e-04: T=0.049  σ=0.724  ✓ knee区
-g=1e-02: T=0.405  σ=0.815  ✓ knee区
-g=1e-01: T=0.693  σ=0.861  ✓ knee区
-g=1e+00: T=0.693  σ=0.861  ✓ knee区
-g=1e+01: T=1.792  σ=0.941  ✓ knee区
-g=1e+02: T=3.045  σ=0.971  ✓ knee区
-g=1e+04: T=6.215  σ=0.990  knee区
-g=1e+06: T=9.904  σ=0.996  knee区
-```
-
-**零精英追踪。零动态更新。零 JAX 重编译风险。**
-
-### 12.4 API（与 Constran 完全兼容）
-
-```python
-from Constraintdealer.Constran import build, Deterministic
-
-constraints = [
-    Deterministic(viol_obstacle, mode='hard', priority=1),
-    Deterministic(viol_pedestrian, mode='hard', priority=2),
-]
-cost_fn = build(objective_fn, constraints)
-
-# 直接给求解器——和 Constran.build() 完全相同的使用方式
-result = mmog_igo_optimizer_mpc(..., fitness_fn_total=cost_fn, ...)
-```
-
-与 Constran.py 的区别：
-- `T_alpha` 替换 `log_transform`
-- δ 默认 1.0（替换 1.5）
-- 无 `build_dynamic`、`update_gamma_from_elite` 等动态追踪 API
-- `Deterministic`、`Chance`、`Robust`、`DRO` 接口完全相同
-
-### 12.5 自定义 knot 表
-
-```python
-from Constraintdealer.Constran import T_alpha, sigma_k
-import numpy as np
-
-my_knots_g = np.array([1e-4, 1e0, 1e4])
-my_knots_a = np.array([100,   1.0,  0.01])
-
-# 在自定义 g_fn 中使用
-def my_violation(x, ctx):
-    g_raw = compute_violation(x)
-    return T_alpha(g_raw, my_knots_g, my_knots_a)
-```
