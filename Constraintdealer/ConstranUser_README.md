@@ -1,19 +1,21 @@
-# Constran 用户手册
+# Constran — 通用黑箱优化 Cost 构造引擎
 
-**Constran** 是约束转化引擎——你写精确罚函数 `max(0, g(x))`，它自动组装成求解器能用的代价函数。
+**Constran** 是一个将多目标 + 约束转化为单一标量 cost 的引擎，供 IGO/GMM 等零阶求解器使用。
+
+核心理念：**σ 饱和嵌套 = 优先级编码**。外层先优化，内层在外层满足后精细优化。无需手动调权重，无需 `jnp.where` 分支。
 
 ---
 
 ## 目录
 
 1. [三步上手](#1-三步上手)
-2. [四种约束类型](#2-四种约束类型)
-3. [两种模式 + Tunable 连续谱](#3-两种模式--tunable-连续谱)
-4. [Tunable 参数怎么选](#4-tunable-参数怎么选)
-5. [容忍度与时域累加](#5-容忍度与时域累加)
+2. [核心机制](#2-核心机制)
+3. [优先级嵌套](#3-优先级嵌套)
+4. [逐层 k 校准](#4-逐层-k-校准)
+5. [约束类型与聚合](#5-约束类型与聚合)
 6. [变换表与预设](#6-变换表与预设)
-7. [语义速查表](#7-语义速查表)
-8. [MPC 用法](#8-mpc-用法)
+7. [MPC 用法](#7-mpc-用法)
+8. [数值特性参考](#8-数值特性参考)
 9. [常见问题](#9-常见问题)
 
 ---
@@ -23,365 +25,440 @@
 ```python
 from Constraintdealer.Constran import *
 
-# ① 写目标函数和约束 (精确罚函数形式: max(0, g(x)))
+# ① 写目标和约束 — 约束用精确罚函数 max(0, g(x))
 def my_obj(x, ctx):
-    return jnp.sum((x[:2] - ctx['target'])**2) + 0.1 * jnp.sum(x[2:]**2)
+    return jnp.sum((x[:2] - ctx['target'])**2)
 
-def obstacle_violation(x, ctx):
-    penetration = safe_dist - compute_min_dist(x, ctx)
-    return jnp.sum(jnp.where(penetration > 0, penetration, 0.0))
+def collision_penalty(x, ctx):
+    d = jnp.sqrt(jnp.sum((x[:,:2] - ctx['obs_pos'])**2, axis=-1))
+    return jnp.maximum(0.0, ctx['safe_dist'] - d)  # 向量或标量
 
-# ② 声明约束
-constraints = [
-    Deterministic(obstacle_violation, mode='hard', priority=1),
-    Deterministic(lambda x, ctx: jnp.sum(x[2:]**2) - efficiency_limit,
+# ② 声明层级 — priority 越小越外层（越优先）
+layers = [
+    Deterministic(collision_penalty, mode='hard',   priority=1, aggregate='max'),
+    Deterministic(lambda x,c: jnp.sum(x[2:]**2),
                   mode='tunable', priority=2, tune_preset='standard'),
 ]
 
 # ③ 构建 → 给求解器
-cost_fn = build(my_obj, constraints)
-result = mmog_igo_optimizer_mpc(..., fitness_fn_total=cost_fn, context=ctx)
+cost_fn = build(my_obj, layers)                     # auto_k=True 默认开启
+result = solver(..., fitness_fn_total=cost_fn, context=ctx)
 ```
 
-**你只需要写 `max(0, g(x))` 形式的约束函数。** 正值 = 违反，零 = 满足。Constran 自动做 T_alpha 变换、σ 嵌套、优先级组装。
+**你只需要写目标和违反函数。** Constran 自动处理：T_alpha 范围压缩 → σ 饱和 → 逐层嵌套 → 逐层 k 校准。
 
 ---
 
-## 2. 四种约束类型 + 内置聚合
+## 2. 核心机制
 
-| 类型 | 你写 | Constran 自动计算 g_raw |
-|------|------|----------------------|
-| `Deterministic` | `g(x)`（标量或向量） | `aggregate` 聚合 → 标量 |
-| `Chance` | `g(x, ξ)` + 噪声分布 | 聚合 → $Q_{1-\alpha}$ |
-| `Robust` | `g(x, ξ)` + 不确定性集 Ξ | 聚合 → $\max_{\Xi}$ |
-| `DRO` | `g(x, ξ)` + 模糊集 | 聚合 → $\max_P Q_{1-\alpha}$ |
+Constran 用三个构建块把任意数量、任意尺度的目标和约束组装成一个标量。
 
-### 内置聚合 `aggregate`
+### 2.1 T_alpha — 多段对数变换
 
-**轨迹上每个采样点的违反构成一个向量。** 用 `aggregate` 指定聚合方式，
-无需在 `g_fn` 里手写 `sum`/`mean`：
+原始 $g$ 可能从 $10^{-6}$ 到 $10^6$（12 个数量级），直接塞给求解器会让大值淹没小值。T_alpha 用分段的 log 类变换把 $g$ 压缩到 $[0, 13]$：
 
-```python
-# g_fn 直接返回每步的穿透向量, Constran 帮你聚合
-Deterministic(
-    lambda x, ctx: jnp.maximum(0.0, safe_dist - min_dists(x, ctx)),  # (H,) 向量
-    aggregate='sum',    # 总穿透量 (默认)
-    mode='soft', priority=1,
-)
-
-Deterministic(
-    lambda x, ctx: jnp.maximum(0.0, safe_dist - min_dists(x, ctx)),
-    aggregate='mean',   # 平均穿透, 与时域长度无关
-    mode='soft', priority=1,
-)
+```
+T_alpha(g) = sign(g) × T_target(|g|)
 ```
 
-| aggregate | 语义 | 适用 |
-|-----------|------|------|
-| `'sum'`（默认） | 总违反量 | "全程擦边比单点碰撞差" |
-| `'mean'` | 平均每步违反 | "只看步均, 与时域长度无关" |
-| `'max'` | 最危险的一步 | "不允许任何一步超出极限" |
-| `'count'` | 违反步数 | "广度比深度重要" |
-| `'q90'`, `'q95'`, `'q99'` | 分位数 | "允许 10%/5%/1% 的采样点违规" |
+通过对数-线性插值结点表实现。关键特性：
+- **小 g 有地板**：$g \to 0^+$ 时 $T \to T_{\text{floor}} > 0$，确保微小违反立即被感知
+- **大 g 近似 log**：$g$ 很大时 $T \approx \log(g)$，大范围可区分
+- **g=0 恰好为 0**：满足时贡献为零
 
-### 聚合方式怎么选
+三档标定表（分辨率递增）：
 
-**先问自己：这个约束是在管"总体"还是管"最坏"？**
+| 表 | 分辨率 | 地板 T(0⁺) | 用途 |
+|----|--------|-----------|------|
+| `TRANSFORM_SOFT` | $10^{-2}$ | 0.03 | 偏好、微调 |
+| `TRANSFORM_TUNABLE` | $10^{-4}$ | 0.15 | 通用可调 |
+| `TRANSFORM_HARD` | $10^{-6}$ | 0.5 | 安全、硬约束 |
 
-| 约束类型 | 推荐聚合 | 原因 |
-|---------|---------|------|
-| **避障/碰撞** | `max` 或 `q95` | 安全性由最危险的点决定。`max`=一个点都不行，`q95`=允许 5% 点擦边 |
-| **能耗/燃料** | `sum` | 总消耗量，累加才有意义 |
-| **跟踪误差** | `mean` | 平均偏离，与时域长度解耦 |
-| **曲率/平滑** | `mean` 或 `q90` | 整体舒适度，允许偶尔急转 |
-| **速度/加速度限制** | `max` | 任何一步超限就是违规 |
-| **终端约束** | 不加聚合（单点） | 只看最后一步 |
+### 2.2 σ_k — 饱和函数
 
-**分位数 `q95` 的空间含义**（不是概率！是对轨迹采样点排序）：
+$$\sigma_k(x) = \frac{kx}{\sqrt{1 + (kx)^2}}, \quad \text{输出} \in (-1, 1)$$
 
-```python
-# B-spline 200 采样点, q95 表示:
-#   排序后取第 190 个（95%）, 允许 10 个最差的点被忽略
-#   适合: 拐角处偶尔擦边可以忍, 但 95% 的轨迹必须是安全的
+$k$ 控制拐点位置：$\sigma$ 在 $x = 1/k$ 处达到 $1/\sqrt{2} \approx 0.707$。
 
-Deterministic(
-    lambda x, ctx: jnp.maximum(0.0, safe_dist - min_dists(x, ctx)),
-    aggregate='q95',   # 200 点中允许 10 点擦边
-    mode='hard', priority=1,
-)
+| k | 拐点 (T 值) | 近似线性区 | 动态范围/层 |
+|---|------------|----------|-----------|
+| 0.2 | T=5 | T ∈ [0, 5] | ~3 decades |
+| 0.5 | T=2 | T ∈ [0, 2] | ~2 decades |
+| 1.0 | T=1 | T ∈ [0, 1] | ~1.5 decades |
+
+小 k = 宽线性区 = 强优先级。大 k = 窄线性区 = 好穿透力。**二者不可兼得——逐层 k 校准解决这个矛盾（见 §4）。**
+
+### 2.3 两种模式
+
+所有层都是加性的（无分支）。只有两种模式：
+
+```
+Soft:    cost = σ_k( T(g) + inner )
+Tunable: cost = σ_k( δ·σ₁(β·T(g)) + inner )
 ```
 
-**典型 B-spline 配置：**
+| 模式 | 公式 | 参数 | 何时用 |
+|------|------|------|--------|
+| **Soft** | $T(g) + \text{inner}$ | 无 | 偏好、微调、最简场景 |
+| **Tunable** | $\delta \cdot \sigma_1(\beta \cdot T(g)) + \text{inner}$ | β, δ | 需要控制"软硬"的层 |
+
+Tunable 的 β 控制"多快触发"（类似硬度），δ 控制"最多扣几分"（类似权重）。常用预设：
+
+| tune_preset | β | δ | 语义 |
+|-------------|----|----|------|
+| `'mild'` | 0.1 | 1.0 | 极软，大违反才触发 |
+| `'standard'` | 0.3 | 1.0 | 标准（默认） |
+| `'firm'` | 0.5 | 1.5 | 适中 |
+| `'strong'` | 1.0 | 1.5 | 较硬 |
+| `'nearhard'` | 1.0 | 2.0 | 近似硬约束 |
+| `'hard'`（自动→） | 1.0 | 1.5 | 硬约束 |
+
+`mode='hard'` 自动映射为 `tunable + β=1.0`，无需手动设参数。
+
+### 2.4 嵌套即优先级
+
+`build()` 把所有层按 priority 排序后嵌套。**priority 数字越小越外层，越优先满足：**
+
+```
+最终 cost = σ_{k_n}(  contrib_n  +  σ_{k_{n-1}}(  contrib_{n-1}  +  ...  +  σ_{k₁}(  T(obj)  ) ... ))
+                      ↑ 最外层 P1                            ↑ 最内层 Pn
+```
+
+每层 σ 把内部所有内容再压缩一次。**外层直接命中最终 cost，内层被层层压缩**——求解器自然优先优化外层。
+
+**选择压力数据**（k=0.2 外层 vs k=1.0）：
+
+| 外层违反 g | k=0.2 的导数 | k=1.0 的导数 | 说明 |
+|-----------|------------|------------|------|
+| 100 | 0.083 | 0.103 | k=0.2 在严重违反时也有信号 |
+| 10 | 0.200 | 0.093 | k=0.2 峰值在中度违反区 |
+| 1 | **0.355** | 0.093 | k=0.2 选择压力是 k=1.0 的 3.5× |
+| 0.1 | 0.155 | 饱和 | k=1.0 进入死区 |
+
+**k=0.2 的"缓坡"不是缺陷**——它让求解器在宽范围内始终有方向可走，不会像 k=1.0 那样遇到饱和死区。
+
+---
+
+## 3. 优先级嵌套
+
+### 3.1 基本用法
 
 ```python
-constraints = [
-    # 碰撞: max — 最危险点决定安全
-    Deterministic(collision_pen, aggregate='max', mode='hard', priority=1),
-    # 曲率: mean — 整体平滑度
-    Deterministic(curvature_pen, aggregate='mean', mode='soft', priority=2),
-    # 速度: max — 不能有任何一步超速
-    Deterministic(speed_pen, aggregate='max', mode='hard', priority=3),
+layers = [
+    # P1 最外层：碰撞 — 任何一点都不行
+    Deterministic(collision, mode='hard', priority=1, aggregate='max'),
+    # P2：曲率 — 整体平滑，允许偶尔急转
+    Deterministic(curvature, mode='tunable', priority=2, aggregate='mean',
+                  tune_preset='standard'),
+    # P3 最内层：跟踪 — 软偏好，好跟踪可补偿
+    Deterministic(tracking, mode='soft', priority=3, aggregate='sum'),
+]
+cost_fn = build(my_obj, layers)
+```
+
+### 3.2 动态范围分配
+
+外层获得更大的 cost 动态范围，内层被压缩——这就是优先级机制：
+
+| 层 | 嵌套位置 | Cost 范围 | 可区分数 | 含义 |
+|----|---------|----------|---------|------|
+| collision (P1) | 外层 | 0.26 | ~2000 | 求解器主要优化目标 |
+| curvature (P2) | 中层 | 0.035 | ~2900 | 在安全前提下优化 |
+| tracking (P3) | 内层 | 0.007 | ~2900 | 在最内层微调 |
+
+### 3.3 物理链嵌套（ODE 积分链）
+
+对于 jerk → acc → vel → pos 积分链，**下导数（决策量）应嵌套在外层，上状态应嵌套在内层**：
+
+```python
+layers = [
+    Deterministic(jerk_viol,  mode='tunable', priority=1, tune_preset='firm'),
+    Deterministic(acc_viol,   mode='tunable', priority=2, tune_preset='standard'),
+    Deterministic(vel_viol,   mode='tunable', priority=3, tune_preset='standard'),
+    Deterministic(pos_viol,   mode='soft',    priority=4),
 ]
 ```
 
-**对比: sum vs max vs mean vs q95（同一个 B-spline 200 点轨迹）**
+等价于隐式编码"加速度不能突变 → 速度不能突变 → 位置连续"——无需显式写 ODE。
 
-```
-每点穿透: 180点擦0.01 + 10点碰0.5 + 10点撞2.0
+**数值验证**：Physics（jerk 外→pos 内）vs Reversed（pos 外→jerk 内）：
 
-sum=0.61:   全过程总穿透 → 最敏感，擦边也被放大
-mean=0.11:  平均每步 → 与轨迹长度无关
-max=0.33:   只看最危险点 → 2.0m 那一步决定一切
-q95=0.17:   忽略最差的 10 个点 → 介于 mean 和 max 之间
-count=0.76: 只看违规点数 → 200 点中 20 点违规
-```
+| 场景 | Physics | Reversed |
+|------|:-:|:-:|
+| jerk=100, pos=0 | **0.271** | 0.006 |
+| jerk=0, pos=100 | 0.006 | **0.271** |
+| pos=10 固定, jerk 扫 0→1000 | Δ=**+0.277** | Δ=+0.006 |
 
----
+Physics 顺序下 cost 随 jerk 剧烈变化、随 pos 几乎不变 → 求解器拼命降 jerk，在平滑前提下微调位置。
 
-## 3. 两种模式 + Tunable 连续谱
+### 3.4 层数选择
 
-没有 `jnp.where`。所有约束都是加性的。只有两种模式：
-
-```python
-# Tunable: δ·σ(β·T(g)) + inner  — β 控制软硬
-# Soft:    T(g) + inner           — 最简, 无参数
-```
-
-| mode | β | 行为 | 何时用 |
-|------|---|------|--------|
-| `'soft'` | — | T(g) 直接加，无参数 | 最简场景 |
-| `'tunable'` + `tune_preset='mild'` | 0.1 | 极软，大违反才触发 | 舒适/效率偏好 |
-| `'tunable'` + `tune_preset='standard'` | 0.3 | 标准软 | 默认软约束 |
-| `'tunable'` + `tune_preset='firm'` | 0.5 | 适中 | 重要偏好 |
-| `'tunable'` + `tune_preset='strong'` | 1.0 | 较硬 | 较强约束 |
-| `'tunable'` + `tune_preset='nearhard'` | 1.0 | 硬，δ 更大 | 近似硬 |
-| `'hard'` (自动→ tunable β=1) | 1.0 | **硬约束** | 安全、物理极限 |
-
-**`mode='hard'` 自动映射为 `tunable + β=1.0`。** 旧代码无需改动。
-
-### 关键区别（g≥0 精确罚函数）
-
-```
-g=0.001 (微小违反):  β=0.1 → 几乎无感    β=1(hard) → 立刻感知
-g=100   (严重违反):  β=0.1 → 温和惩罚    β=1(hard) → 强惩罚
-```
-
-`β=1` 在 $g \to 0^+$ 处提供了层级分离，同时保留违反区区分度。$β>1$ 会导致 σ 饱和、丢失信息。
+| 层数 | 效果 |
+|------|------|
+| 1-2 | 弱优先级，目标和约束几乎平等竞争 |
+| 3-5 | 推荐范围，优先级梯度清晰（如 Simple.py） |
+| 6-10 | 需要 `auto_k=True`（默认），逐层 k 校准保证穿透 |
+| >10 | 建议把底层合并到同一 priority，共享 σ 层 |
 
 ---
 
-## 4. Tunable 参数怎么选
+## 4. 逐层 k 校准
 
-### δ_soft — "最多扣几分"
+### 4.1 为什么需要
 
-内层内容经 σ 后输出约 $[0, 0.7]$。以此为参考：
+所有层用相同 k（如全局 k=0.2）时，最内层信号经过 n 层 σ 压缩，增益为 $0.2^n$：
 
-| δ_soft | 效果 |
-|--------|------|
-| 0.3~0.5 | 轻偏好，用于硬约束（甜点） |
-| 1.0~1.5 | 与目标同级竞争 |
-| 2.0~3.0 | 强偏好，通常压倒目标 |
+| n | 最内层增益 | 可区分 f32 值 | 状态 |
+|---|----------|-------------|------|
+| 4 | $1.6 \times 10^{-3}$ | ~3000 | ✓ |
+| 7 | $1.3 \times 10^{-5}$ | ~200 | 临界 |
+| 10 | $1.0 \times 10^{-7}$ | ~5 | ☠ 死 |
+| 12 | $4.1 \times 10^{-9}$ | ~1 | ☠ 求解器发散 |
 
-### β — "多快触发"（仅自定义时需设）
+### 4.2 几何 taper
 
-通常直接用 `tune_preset` 就够了。手动设 β 的场景：
+`auto_k=True`（默认）时，`build()` 自动为每层分配不同的 k：
 
-| 可接受违反 | β | 效果 |
-|-----------|-----|------|
-| ~10 | 0.1 | 非常软 |
-| ~1 | 0.5 | 标准过渡 |
-| ~0.1 | 1.0 | 较锐（硬约束甜点） |
-| ~0.01 | 5.0+ | 很锐 |
-
-### 套餐速查
-
-```python
-# 轻微偏好
-Deterministic(viol, mode='tunable', priority=3, tune_preset='mild')
-
-# 标准软约束
-Deterministic(viol, mode='tunable', priority=2, tune_preset='standard')
-
-# 重要但可调
-Deterministic(viol, mode='tunable', priority=2, tune_preset='firm')
-
-# 近似硬
-Deterministic(viol, mode='tunable', priority=1, tune_preset='nearhard')
-
-# 硬约束 (最简写法)
-Deterministic(viol, mode='hard', priority=1)
+```
+k_i = k_outer × r^(n-i)    [外层 k_n=0.2, 内层逐步增大到 k→1.0]
 ```
 
----
+- 外层保持 k≈0.2（强优先级，3 decades 范围）
+- 内层逐步增大到 k→1.0（深度无关穿透，增益恒为 1）
+- 一旦 k 达到 1.0，再加层无额外压缩
 
-## 5. 容忍度与时域累加
+**T_alpha 缩放补偿**：内层 k 增大后，σ 拐点左移（更容易饱和）。T_alpha 表同步缩放 `T_new = T_old × (0.2/k_i)`，保持 σ(T_max) 恒定。数学上，σ∘T 曲线在不同 k 下完全重合。
 
-**关键：你写的 `g_fn` 返回的是整个时域上的总和。** $g_{\text{total}} = \sum_t \max(0, \text{pen}_t)$。
-时域越长累加越大，代价自动递增——不需要额外参数。
+### 4.3 效果验证
 
-### 三档默认的容忍度
+n=10 层，2000 点密集采样：
 
-| 每步穿透 | H=1 (Soft) | H=10 | H=50 | H=200 | (Tunable) | (Hard) |
-|---------|-----------|------|------|-------|-----------|--------|
-| 0.01 | **+0.03** 轻触 | +0.08 | +0.14 | +0.30 | +0.04→+0.11 | **+0.23** 重罚 |
-| 0.1 | +0.08 | +0.11 | +0.17 | +0.38 | +0.05→+0.12 | +0.25 |
-| 1.0 | +0.23 | — | — | — | +0.09→+0.13 | +0.27 |
+| 层 | Equal k=0.2 | Auto-calibrated |
+|----|------------|----------------|
+| 外层 (P1) | 1429 ✓ | 1429 ✓ |
+| 中层 | 1144 ✓ | 1144 ✓ |
+| **内层 (P10)** | **5 ☠** | **1003 ✓** |
 
-**Soft:** 累加敏感——200 步擦边代价远超 1 步。目标和约束平等竞争。  
-**Tunable:** σ 压缩——边际递减，累积不如 Soft 敏感。  
-**Hard:** 一步即重罚——$g=10^{-6}$ 就 $> 0.24$，超过任何无违反状态。保证"任何违反 > 任何满足"。
+n=12 层：
 
-### 如果默认不满足需求
+| 层 | Equal k=0.2 | Auto-calibrated |
+|----|------------|----------------|
+| 外层 (P1) | 1429 ✓ | 1429 ✓ |
+| 内层 (P12) | **1 ☠** | **786 ✓** |
 
-**调容忍度——改结点表的 $T$ 值：**
+全部满足 500-1000 可分辨值的需求。
+
+### 4.4 控制参数
 
 ```python
-from Constraintdealer.Constran import Deterministic, TRANSFORM_SOFT
-import numpy as np
-
-# 自定义: 让 Soft 对 g<0.1 更不敏感
-my_soft = (
-    np.array([1e-4, 1e-3, 1e-2, 1e-1, 1, 10, 100, 1e4, 1e6]),
-    np.array([0.01, 0.02, 0.05, 0.15, 0.5, 1.5, 4.0, 8.0, 12.0]),
-    #        ↑ 改这些小 g 的 T 值 → 调小 = 更不敏感
+cost_fn = build(obj, layers,
+    auto_k=True,        # 默认开启，≥2 层时生效
+    k_outer=0.2,        # 最外层 k，增大 = 加快外层收敛但减小范围
 )
-
-Deterministic(viol, mode='soft', priority=1,
-              _transform_table=my_soft)
+# 关闭校准 → 所有层用全局 k=0.2
+cost_fn = build(obj, layers, auto_k=False)
 ```
 
-**调累加速度——改聚合策略：**
+更深嵌套用更大 target_gain：
 
 ```python
-# 方案 A (默认): 先 sum 再 T — 总穿透量
-def g_fn(x, ctx):
-    pens = compute_penetrations(x)  # (H,)
-    return jnp.sum(jnp.maximum(0.0, pens))
+from Constraintdealer.Constran import auto_calibrate_k
+ks = auto_calibrate_k(15, k_outer=0.2, target_gain=0.01)  # 更强穿透
+```
 
-# 方案 B: 先 T 再 sum — 每步独立压缩, 大穿透打折
-def g_fn(x, ctx):
-    pens = compute_penetrations(x)
-    return jnp.sum(T_alpha(jnp.maximum(0.0, pens)))
-    # 200×0.01 ≈ 200×0.02 = 4.0 走另一条累加路径
+---
+
+## 5. 约束类型与聚合
+
+### 5.1 四种约束
+
+| 类型 | 输入 | Constran 自动 |
+|------|------|-------------|
+| `Deterministic` | `g(x)` | `aggregate` 聚合 → 标量 |
+| `Chance` | `g(x,ξ)` + 噪声 | 聚合 → $Q_{1-\alpha}$ |
+| `Robust` | `g(x,ξ)` + 不确定集 Ξ | 聚合 → $\max_{\Xi}$ |
+| `DRO` | `g(x,ξ)` + 模糊集 | 聚合 → $\max_P Q_{1-\alpha}$ |
+
+### 5.2 内置聚合
+
+轨迹上每采样点构成向量。用 `aggregate` 指定聚合方式，无需在 `g_fn` 里手写 sum/mean：
+
+| aggregate | 语义 | 适用 |
+|-----------|------|------|
+| `'sum'`（默认） | 总违反量 | 能耗、总偏差 |
+| `'mean'` | 步均违反 | 跟踪误差（与时域解耦） |
+| `'max'` | 最危险一步 | 避障、速度限制 |
+| `'count'` | 违反步数 | 广度优于深度 |
+| `'q90'`,`'q95'`,`'q99'` | 分位数 | 允许 10%/5%/1% 点擦边 |
+
+### 5.3 聚合决策表
+
+| 约束 | 推荐聚合 | 原因 |
+|------|---------|------|
+| 避障/碰撞 | `max` 或 `q95` | 最危险点决定安全 |
+| 速度/加速度限制 | `max` | 任何一步超限即违规 |
+| 曲率/平滑 | `mean` 或 `q90` | 整体舒适度 |
+| 跟踪误差 | `mean` | 与时域解耦 |
+| 能耗/燃料 | `sum` | 总消耗 |
+| 终端约束 | 不加聚合 | 只看最后一步 |
+
+### 5.4 语义速查
+
+```
+"任何碰撞都不行"
+  → Deterministic(viol, mode='hard', priority=1, transform='sharp')
+"小擦边无所谓，别大撞就行"
+  → Deterministic(viol, mode='tunable', priority=2, tune_preset='standard')
+"只是偏好，好跟踪可补偿偶尔擦边"
+  → Deterministic(viol, mode='soft', priority=3)
 ```
 
 ---
 
 ## 6. 变换表与预设
 
-T_alpha 把原始 $g$ 映射到 $[0, 12]$ 范围。每层可选择变换风格：
+### 6.1 约束变换
 
 ```
-transform='standard'  — 默认, 地板 T(0⁺)=0.7
-transform='sharp'     — 地板 T(0⁺)=1.0, 小违反立刻重罚
-transform='tight'     — 地板 T(0⁺)=0.3, 近 log 但无盲区
-transform='wide'      — 地板 T(0⁺)=0.3, 宽线性区
-transform='log'       — 原版 log_transform, 无地板
+transform='soft'     — 地板 T(0⁺)=0.03, 分辨率 1e-2, 偏好/微调
+transform='tunable'  — 地板 T(0⁺)=0.15, 分辨率 1e-4, 通用（默认）
+transform='hard'     — 地板 T(0⁺)=0.5,  分辨率 1e-6, 安全约束
 ```
 
-目标函数也有自己的变换：
-```python
-cost_fn = build(my_obj, constraints, obj_transform='standard')  # 默认
-cost_fn = build(my_obj, constraints, obj_transform='flat')      # 更平, 适合超大范围
-cost_fn = build(my_obj, constraints, obj_transform='log')       # 原版
-```
-
-**约束层 σ 默认 $k=0.2$**（拐点在 $g \approx 150$），12 个数量级全可区分。目标层 $k_{\text{inner}}=0.1$。
-
----
-
-## 6. 语义速查表
-
-### 完整语义 → 方案映射
-
-```
-"任何碰撞都不行"
-  → Deterministic(viol, mode='hard', priority=1, transform='sharp')
-
-"碰撞越深越差，但 10m 和 100m 差不多"
-  → Deterministic(viol, mode='tunable', priority=1, tune_preset='firm')
-
-"小擦边无所谓，别大撞就行"
-  → Deterministic(viol, mode='tunable', priority=2, tune_preset='standard')
-
-"只是偏好，好跟踪可补偿偶尔擦边"
-  → Deterministic(viol, mode='soft', priority=3)
-
-"安全就是安全，微小违反也要感知"
-  → Deterministic(viol, mode='hard', priority=1, transform='sharp')
-
-"越远离约束越好（奖励深度满足）"
-  → 使用带符号的 g(x) 而非 max(0,g), mode='soft'
-```
-
-### 先 T 再 Sum（每点独立压缩再聚合）
-
-当前 Constran 对 g_fn 返回的标量做 T——即**先 sum 再 T**。
-如果想**先 T 再 sum**，直接在 g_fn 里做：
+自定义变换表（调容忍度）：
 
 ```python
-def g_fn(x, ctx):
-    pens = compute_penetrations(x)          # (200,) 向量
-    return jnp.sum(log_transform(pens))     # 先 T 再 sum
-    # Constran 会再 T 一次 → "双重 T", 无害
+my_table = (
+    np.array([1e-4, 1e-2, 1e-1, 1, 10, 100, 1e4, 1e6]),   # knots_g
+    np.array([0.01, 0.05, 0.2, 0.5, 1.5, 4.0, 8.0, 12.0]), # knots_T
+)
+Deterministic(viol, mode='soft', priority=1, _transform_table=my_table)
 ```
 
-双重 T 不破坏单调性。详见 [ConstraintsTransformation_README.md](ConstraintsTransformation_README.md)。
+### 6.2 目标变换
+
+```python
+cost_fn = build(my_obj, layers, obj_transform='standard')  # 默认
+cost_fn = build(my_obj, layers, obj_transform='flat')      # 更平, 超大范围
+cost_fn = build(my_obj, layers, obj_transform='log')       # 原版 log
+```
 
 ---
 
 ## 7. MPC 用法
 
-### 关键：build 一次，ctx 传动态信息
+**关键：build 一次，ctx 传动态信息。**
 
 ```python
-# ✓ 正确
-cost_fn = build(my_obj, constraints)    # ← 只调一次
+cost_fn = build(my_obj, layers)  # ← 只调一次
 
 for step in range(T_mpc):
-    ctx = {'target': targets[step], 'obs_pos': obs[step], ...}
+    ctx = {'target': targets[step], 'obs_pos': obs[step]}
     result = solver(..., fitness_fn_total=cost_fn, context=ctx)
-
-# ✗ 错误 — 每次都 rebuild → 每次都 JIT 重编译
-for step in range(T_mpc):
-    cost_fn = build(my_obj, constraints)  # 不要！
-    result = solver(...)
 ```
 
-### 多智能体
+多智能体：
 
 ```python
 agent_fns = build_multi_agent({
-    0: (obj_agent0, [Deterministic(viol0, mode='hard', priority=1)]),
+    0: (obj_agent0, [Deterministic(v0, mode='hard', priority=1)]),
     1: (obj_agent1, []),
 })
-result = mmog_igo_rne_blocks_solver(..., fitness_fn_j=agent_fns[0], ...)
 ```
 
 ---
 
-## 8. 常见问题
+## 8. 数值特性参考
 
-### Q: mode='hard' 和 mode='tunable' + tune_preset='nearhard' 有什么区别？
+### 8.1 Float32 分辨率
 
-`mode='hard'` 自动设 β=1.0, δ=0.5。`nearhard` 设 β=1.0, δ=2.0。前者 δ 更小，违反区动态范围更大。
+IGO 求解器不用梯度，纯靠 float32（~7 位精度）比大小。如果多个样本 cost 相同 → 求解器无选择压力 → 发散。
 
-### Q: δ 设多大合适？
+Constran 保证每层 ≥ 500 可区分 f32 值（默认 auto_k）：
 
-硬约束（β=1）：δ=0.3~0.5。软约束：δ=1.0~1.5。Tunable：用 `tune_preset` 自动选。
+| 深度 | 最外层 | 中层 | 最内层 | 达标 |
+|------|--------|------|--------|------|
+| 4-8 | 1429 | 1144 | 1144 | ✓✓ |
+| 10 | 1429 | 1144 | 1003 | ✓✓ |
+| 12 | 1429 | 1143 | 786 | ✓ |
+| 15 | 1429 | 1143 | ~500 | 需调 target_gain |
 
-### Q: 违反区会太"平坦"吗？
+### 8.2 深度极限
 
-用 $k=0.2$ 的约束层 σ，$g$ 从 $10^{-6}$ 到 $10^6$ 的 12 个数量级全可区分。只有 $g > 10^6$ 才开始饱和——这是物理极限。
+| k 策略 | 最大安全深度 | 衰减模式 |
+|--------|------------|---------|
+| Equal k=0.2 | ~7 | 指数 $0.2^n$ |
+| Equal k=0.5 | ~17 | 指数 $0.5^n$ |
+| Equal k=1.0 | 200+ | 无衰减（增益恒 1） |
+| Taper 0.2→1.0 | 15+ | 内层穿透保持 |
 
-### Q: 支持多少层约束？
+**k=1.0 定理**：σ₁'(0) = 1，所以 σ₁^(n)'(0) = 1。小信号穿透力与深度无关。
 
-任意 $M$。按 priority 排序后逐层嵌套。20 层测试通过。
+### 8.3 k 的选择压力
+
+外层 k=0.2 的缓坡意味着求解器在中度违反区（g≈1-10）有最强选择压力（导数 0.36，是 k=1.0 的 3.5×），在严重违反区（g≈100）仍有信号（导数 0.08）。k=1.0 在 g>10 后进入饱和死区。
+
+---
+
+## 9. 常见问题
+
+### Q: 嵌套顺序怎么确定？
+
+**先安全，后性能，最后微调。** 碰撞 > 动力学限制 > 平滑 > 跟踪。积分链中下导数在外、状态在内。
+
+### Q: soft vs tunable 怎么选？
+
+不確定時用 `tunable + standard`。確定只是微調偏好用 `soft`。安全相關用 `hard`。
+
+### Q: auto_k 会改变现有代码的行为吗？
+
+外层 k 不变（仍为 0.2），内层 k 增大 → 内层穿透力更强、目标函数压缩更少。这对优化行为是改善。如需完全兼容，设 `auto_k=False`。
+
+### Q: δ 设多大？
+
+- 硬约束：δ = 0.3~0.5
+- 软约束/偏好：δ = 1.0~1.5
+- 用 `tune_preset` 自动选
 
 ### Q: 会被"深度满足"扰乱吗？
 
-精确罚函数 $g \ge 0$ 天然不存在深度满足——满足时 $g=0$，$\mathcal{T}(0)=0$，贡献为零。
+精确罚函数 g ≥ 0 天然不存在深度满足——满足时 g=0, T(0)=0, 贡献为零。
 
-### Q: 约束函数里能做复杂计算吗？
+### Q: 先 sum 再 T 还是先 T 再 sum？
 
-可以。`g_fn` 可以是任意 JAX 计算——rollout 轨迹、MC 采样、查表。只要返回标量。
+默认先 sum 再 T（g_fn 返回标量，Constran 做 T）。如需先 T 再 sum，直接在 g_fn 里做——双重 T 不破坏单调性。
+
+---
+
+## 附录：完整示例 (Simple.py 同款)
+
+```python
+from Constraintdealer.Constran import *
+
+def my_obj(x, ctx):
+    pos, vel = evaluate_trajectory(x, ctx)
+    return (25.0 * jnp.sum((pos[:,1] - ctx['y_ref'])**2) +
+             5.0 * jnp.sum((vel - ctx['v_ref'])**2))
+
+layers = autodelta([
+    # P1 最外层：避障 — 硬约束，max（最危险点）
+    Deterministic(collision_pen, mode='hard', priority=1,
+                  aggregate='max', transform='hard'),
+    # P2：曲率 — tunable，mean（整体平滑）
+    Deterministic(curvature_pen, mode='tunable', priority=2,
+                  aggregate='mean', tune_preset='standard'),
+    # P3：jerk — soft，mean（舒适偏好）
+    Deterministic(jerk_pen, mode='soft', priority=3,
+                  aggregate='mean', transform='soft'),
+    # P4：车道偏离 — soft，sum（总偏离）
+    Deterministic(lane_pen, mode='soft', priority=4,
+                  aggregate='sum', transform='soft'),
+    # P5 最内层：速度限制 — tunable，max（任何一步超限）
+    Deterministic(speed_pen, mode='tunable', priority=5,
+                  aggregate='max', tune_preset='firm'),
+])
+
+cost_fn = build(my_obj, layers)  # auto_k=True 默认
+# → 外层 k≈0.2（强优先级），内层 k→0.49（穿透）
+# → 每层 ≥ 1000 可区分 f32 值
+```

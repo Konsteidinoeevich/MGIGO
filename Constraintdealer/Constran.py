@@ -200,6 +200,68 @@ TUNE_PRESETS = {
 }
 
 
+# --- Per-layer k calibration ---
+# Geometric taper ensures ∏k_i ≥ target_gain for float32 survival
+# while outer layers keep k≈k_outer for strong priority gradient.
+# Once inner layers hit k=1.0, additional layers cost NOTHING (gain×1=1).
+# This makes the nesting depth-proof for small signals.
+
+def auto_calibrate_k(n_layers: int,
+                     k_outer: float = 0.2,
+                     target_gain: float = 0.003,
+                     ) -> list:
+    """Compute per-layer k values via geometric taper (innermost→outermost).
+
+    Returns k values in the same order as ``_assemble_nest`` layers:
+    ``ks[0]`` = innermost layer (largest k), ``ks[-1]`` = outermost (smallest k).
+
+    Parameters
+    ----------
+    n_layers : int
+        Number of constraint layers.
+    k_outer : float
+        k for the outermost layer. Default 0.2 (knee at T=5, ~3 decades range).
+    target_gain : float
+        Minimum product ∏k_i. Default 0.003 ensures ~1000× f32 resolution
+        at the innermost layer even for small violations (ΔT ≈ 0.002).
+
+    Returns
+    -------
+    ks : list of float
+        Per-layer k, innermost first. Clipped to [k_outer, 1.0].
+    """
+    if n_layers <= 1:
+        return [k_outer]
+
+    # Geometric taper: k_i = k_outer × r^(n-1-i) for i=0..n-1 (innermost..outermost)
+    # Product = k_outer^n × r^{n(n-1)/2}
+    # Solve for r: r = (target_gain / k_outer^n)^{2/(n(n-1))}
+    exponent = 2.0 / (n_layers * (n_layers - 1))
+    r = (target_gain / (k_outer ** n_layers)) ** exponent
+    r = max(1.0, r)  # r<1 would invert priority gradient
+
+    ks = []
+    for i in range(n_layers):
+        k_i = k_outer * r ** (n_layers - 1 - i)
+        ks.append(float(min(1.0, max(k_outer, k_i))))
+    return ks
+
+
+def _rescale_transform_table(knots_g, knots_T,
+                             k_i: float,
+                             k_ref: float = 0.2):
+    """Rescale T-values for layer with σ_{k_i} so σ(T(g)) stays in non-saturated region.
+
+    T_new = T_old × (k_ref / k_i).  This keeps σ_{k_i}(T_max) ≈ σ_{k_ref}(T_max_original).
+
+    Returns (knots_g, knots_T_new).  If k_i == k_ref, returns original table.
+    """
+    if abs(k_i - k_ref) < 1e-10:
+        return (np.array(knots_g), np.array(knots_T))
+    scale = k_ref / k_i
+    return (np.array(knots_g), np.array(knots_T) * scale)
+
+
 @jax.jit
 def sigma_k(x: jnp.ndarray, k: float = 1.0) -> jnp.ndarray:
     """Saturation: σ_k(x) = kx / √(1 + (kx)²). Odd, output ∈ (-1, 1)."""
@@ -452,6 +514,8 @@ def build(objective_fn: Callable[[jnp.ndarray, Any], jnp.ndarray],
           validate: bool = True,
           jit_cost: bool = True,
           obj_transform: str = 'standard',
+          auto_k: bool = True,
+          k_outer: float = 0.2,
           ) -> Callable[[jnp.ndarray, Any], jnp.ndarray]:
     """Build a solver-ready cost function from objective and constraints.
 
@@ -462,6 +526,13 @@ def build(objective_fn: Callable[[jnp.ndarray, Any], jnp.ndarray],
     obj_transform : str
         Preset for objective transform: 'standard', 'flat', or 'log'.
         Also accepts a (knots_g, knots_T) tuple for custom.
+    auto_k : bool
+        If True (default), auto-calibrate per-layer k via geometric taper.
+        Outer layers keep k≈k_outer for strong priority; inner layers
+        increase k toward 1.0 for depth-proof penetration.  T_alpha tables
+        are rescaled to match each layer's k.
+    k_outer : float
+        k for outermost layer when ``auto_k=True``. Default 0.2.
 
     Per-constraint transform:
         Each ConstraintSpec has a ``transform`` field:
@@ -488,11 +559,22 @@ def build(objective_fn: Callable[[jnp.ndarray, Any], jnp.ndarray],
                          f"Available: {list(OBJ_PRESETS.keys())}")
 
     specs_sorted = sorted(constraints, key=lambda s: s.priority, reverse=True)
+    n_layers = len(specs_sorted)
+
+    # Per-layer k calibration
+    if auto_k and n_layers >= 2:
+        ks = auto_calibrate_k(n_layers, k_outer=k_outer)
+    else:
+        ks = None
 
     layers = []
-    for spec in specs_sorted:
+    for i, spec in enumerate(specs_sorted):
         viol_fn = _make_violation_fn(spec)
         table = spec.get_transform_table()
+
+        # Rescale T_alpha table to match per-layer k
+        if ks is not None and table is not None:
+            table = _rescale_transform_table(*table, ks[i])
         T_fn = _make_transform_fn(*table) if table is not None else _make_transform_fn(None, None)
 
         params = {}
@@ -500,6 +582,10 @@ def build(objective_fn: Callable[[jnp.ndarray, Any], jnp.ndarray],
             beta, ds = spec.get_tune_params()
             params['delta_soft'] = ds
             params['beta'] = beta
+
+        # Per-layer k_out (overrides global CONSTRAINT_K in _assemble_nest)
+        if ks is not None:
+            params['k_out'] = ks[i]
 
         layers.append((spec.priority, spec.mode, params, viol_fn, T_fn))
 
