@@ -13,33 +13,35 @@
                                      │
   ┌──────────┐    ┌──────────┐       ▼
   │  spline  │───▶│ frenet   │───▶ [s,d,ḃ,ḋ,s̈,d̈,s⃛,d⃛](t)  ← 规划
-  │  B,dB,   │    │ _traj    │         │
+  │  B,dB,   │    │ _traj    │    evaluate_plan() → st, (x,y)
   │ d2B,d3B  │    └──────────┘         │
-  └──────────┘           │             │
-                         │             ▼
-                    ┌────┴─────┐  ┌──────────┐    ┌──────────┐
-                    │ warmstart│  │   cost   │    │constraints│
-                    │ Greville │  │ Σd²+Σv²  │    │P5→P1 嵌套│
-                    └──────────┘  └────┬─────┘    └────┬─────┘
-                                       │               │
-                                       ▼               ▼
-                                  ┌──────────────────────┐
-                                  │   Constran.build()   │  ← 代价函数
-                                  │  σ 自相似饱和嵌套     │
-                                  └──────────┬───────────┘
-                                             │
-                                             ▼
-                                  ┌──────────────────────┐
-                                  │  IGO 黑箱优化器       │  ← 求解
-                                  │  M=2 blocks, K=3     │
-                                  └──────────┬───────────┘
-                                             │
-                                             ▼
+  └──────────┘                         │
+                         ┌─────────────┼─────────────┐
+                         ▼             ▼             ▼
+                    ┌──────────┐  ┌──────────┐  ┌──────────┐
+                    │ warmstart│  │   cost   │  │constraints│
+                    │ Greville │  │ Σd²+Σv²  │  │P5→P1 嵌套│
+                    │build_mu()│  │build_ctx()│ │g_values()│
+                    └────┬─────┘  └────┬─────┘  └────┬─────┘
+                         │             │               │
+                         ▼             ▼               ▼
+                    ┌──────────────────────────────────────┐
+                    │         build_solver()               │
+                    │  Constran.build() + IGO 一站         │
+                    │  result = solver(key, ctx, mu_init)  │
+                    └────────────────┬─────────────────────┘
+                                     │
+                                     ▼  result.x → ctrl_s, ctrl_d
   ┌──────────────┐    ┌──────────┐    ┌──────────────────────┐
-  │vehicle_model │◀───│ execute  │◀───│ 计划: s̈_cmd,d̈_cmd    │  ← 执行
-  │摩擦圆 + Euler │    │ 取指令+  │    │ (B-spline t=dt)      │
-  │返回真实加速度 │    │ 透传结果 │    └──────────────────────┘
+  │vehicle_model │◀───│ execute  │◀───│  s̈_cmd = plan(t=dt)  │  ← 执行
+  │摩擦圆 + Euler │    │FrenetState│   └──────────────────────┘
   └──────────────┘    └──────────┘
+         │                  │
+         ▼                  ▼
+  ┌──────────┐    ┌──────────────────┐
+  │ reporting│    │     plotting     │
+  │StepReport│    │ setup/render/save│
+  └──────────┘    └──────────────────┘
 ```
 
 ### 核心思想：Frenet → 车辆运动学变换
@@ -67,13 +69,15 @@ a_lat  = -a_t·sinΔψ + a_n·cosΔψ              旋转到车辆横轴
 ```
 Cartest/
 ├── spline.py            # B 样条基函数预计算 (B, dB, d2B, d3B, d4B)
-├── frenet_traj.py       # Frenet B 样条轨迹生成器
+├── frenet_traj.py       # Frenet B 样条: evaluate, evaluate_plan, to_vehicle_states
 ├── reference_path.py    # 参考线抽象 (Straight + 弯道接口)
-├── warmstart.py         # Warm-start (Greville-based)
-├── cost.py              # 目标函数 (速度 + 横向跟踪)
-├── constraints.py       # 约束构建 (积分链 P5→P1)
-├── execute.py           # 执行层: plan → vehicle model → state
-├── vehicle_model.py     # 车辆模型 (点质量 + Euler + 限幅)
+├── warmstart.py         # Warm-start: build_initial_mu, mpc_warmstart
+├── cost.py              # 目标函数 + build_context
+├── constraints.py       # 约束 + compute_g_values + compute_summary
+├── execute.py           # 执行: plan→model→FrenetState
+├── vehicle_model.py     # 车辆模型 (摩擦圆 + Euler)
+├── reporting.py         # StepReport 记录
+├── plotting.py          # 可视化 (setup, render, save)
 ├── Simple.py            # MPC demo
 └── bspline_basis.npz    # 预计算基函数矩阵
 ```
@@ -149,43 +153,33 @@ uv run python Cartest/spline.py
 
 ## 3. 车辆模型 & 执行
 
-Execute 是从计划到仿真的桥梁：取 plan 的期望加速度，传给车辆模型前向仿真，透传模型的真实状态。
+执行链：`execute_step()` 取 plan 的期望加速度 → 车辆模型前向仿真 → 返回 `FrenetState`。
 
 ```python
-# execute.py
-s_ddot_cmd = s_ddot[1]   # plan 在 t=dt 处的期望加速度
-d_ddot_cmd = d_ddot[1]
+from Cartest.execute import execute_step, FrenetState
 
-# 传给 vehicle_model — 摩擦圆限幅 + Euler 积分
-s_new, d_new, s_dot_new, d_dot_new, ax, ay = vehicle.step(
-    s0, d0, s_dot0, d_dot0, s_ddot_cmd, d_ddot_cmd)
-
-# 透传模型的真实加速度（不是 plan 的）
-next_state = {s0=s_new, s_dot0=s_dot_new, s_ddot0=ax, ...}
+# execute_step 内部:
+#   1. s_ddot_cmd = plan(t=dt)      ← plan 的意图
+#   2. vehicle.step(cmd)            ← 摩擦圆 + Euler
+#   3. return FrenetState(s, s_dot, s_ddot=ax, ...)  ← 模型的真实加速度
 ```
 
 ```python
 # vehicle_model.py
 class FrenetVehicleModel:
     def __init__(self, mu=0.85, dt=0.1):
-        self.a_max = mu * 9.81   # ≈ 8.3 m/s² 摩擦圆半径
+        self.a_max = mu * 9.81    # ≈ 8.3 m/s² 摩擦圆
 
     def step(self, s0, d0, s_dot0, d_dot0, s_ddot_cmd, d_ddot_cmd):
-        # 摩擦圆: 合成加速度不超过 μ·g, 保留方向
         a_cmd = sqrt(s_ddot_cmd² + d_ddot_cmd²)
         scale = min(1.0, a_max / a_cmd)
         ax, ay = s_ddot_cmd * scale, d_ddot_cmd * scale
-
         # Euler 积分
-        s_new     = s0     + s_dot0 * dt
-        s_dot_new = s_dot0 + ax * dt
-        d_new     = d0     + d_dot0 * dt
-        d_dot_new = d_dot0 + ay * dt
-
-        return s_new, d_new, s_dot_new, d_dot_new, ax, ay  # 含真实加速度
+        return s0 + s_dot0*dt, d0 + d_dot0*dt, \
+               s_dot0 + ax*dt, d_dot0 + ay*dt, ax, ay
 ```
 
-接口 `step(s0,d0,s_dot0,d_dot0, cmd_s, cmd_d) → (s,d,s_dot,d_dot,s_ddot,d_ddot)`。换模型只需改 `vehicle_model.py`——execute 不碰内部。
+**换模型只需改 `vehicle_model.py`**——`execute_step` 只依赖 `step()` 接口。
 
 ## 4. 代价函数 & 约束
 
@@ -249,20 +243,45 @@ def jerk_g(theta, ctx):   # 同理, 用 st[:,6:8]
 
 ## 5. IGO 优化器
 
-18 维搜索空间 (2 blocks × 9 控制点)，M=2, K=3。
+`build_solver()` 把 Constran 构建 + solver 选择 + 参数初始化 + best-x 提取全包了：
 
 ```python
-mu_k, L_k, pi_k = mmog_igo_optimizer_mpc(
-    key, 500, 0.15,          # IGO steps, dt
-    M=2, K=3,                # blocks, populations
-    B=64, B0=20, T0=250,    # samples, elite, reset
-    dims=(9, 9),             # block dimensions
-    cost_fn,                 # Constran-built
-    mu_init, L_inv, v_init, ctx,
+from gmm_igo.solver_builder import build_solver
+
+solver = build_solver(
+    obj_fn, dims=(9, 9),
+    constraints=constraints,      # Constran.build() 内部处理
+    solver='m22',                 # 自动选: 'auto' / 'm22' / 'reuse_multi'
+    T=500, dt=0.15, K=3, B=64, B0=20, T_0=250,
+    k_inner=0.1, obj_transform='standard',
 )
+
+# MPC 循环中一行求解:
+result = solver(key, context=ctx, initial_mu=mu_init)
+ctrl_s, ctrl_d = result.x[:9], result.x[9:]
+# result.cost, result.mu, result.S_or_L, result.pi 全可用
+
+# 也可继承上一轮 GMM 状态:
+result = solver(key, context=ctx, warm_start=prev_result)
 ```
 
-IGO 是黑箱全局优化——不需要梯度，只要求值。Frenet 下 ctrl→物理量接近线性，搜索空间条件数好，收敛快。
+IGO 是黑箱全局优化——不需要梯度，只要求值。
+
+### MPC 主循环
+
+```python
+state = FrenetState(s=0, s_dot=12, s_ddot=0, d=-3, d_dot=0, d_ddot=0)
+
+for step in range(steps):
+    ctx      = build_context(gen, state, V_TARGET, LANE_HW, obs_pos, obs_rad)
+    mu_init  = build_initial_mu(gen, state.s, state.s_dot, state.d)
+    result   = solver(key, context=ctx, initial_mu=mu_init)
+    frenet, st, (x, y) = gen.evaluate_plan(result.x[:9], result.x[9:], ctx)
+    gv       = compute_g_values(st, d, x, y, obs_pos, obs_rad)
+    sm       = compute_summary(st, d, x, y, obs_pos, obs_rad)
+    state    = execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot, vehicle)
+    report   = StepReport(...)
+```
 
 ## 6. 运行
 
@@ -287,12 +306,17 @@ uv run python Cartest/Simple.py --steps 50 --no-plot
 | `to_vehicle_states` 统一 | cost/约束/reporting 同一口径，离心/Coriolis/(1-d·κ_r) 全包含 |
 | 5 次 B 样条 | C⁴ 连续：jerk 连续，bang 有界 |
 | 单侧夹紧 | 初始状态精确匹配；终端自由（MPC 只执行第一步） |
-| 9 个自由控制点 | 18 维搜索空间，IGO 可处理 |
+| `evaluate_plan()` 一站评估 | Frenet + 车辆状态 + Cartesian 一次调用，避免重复 |
 | Greville-based warm-start | 精确常速轨迹：jerk=0, acc=0 |
+| `build_initial_mu()` | 物理 warm-start → solver-ready mu_init，一行调用 |
 | soft constraints (P2-P5) | 无违规时透明，目标信号不被 baseline 淹没 |
 | hard constraint (P1) | 安全底线，baseline=2.0 不可协商 |
 | 约束三取一罚函数 | `max(|long|-LIM, |lat|-LIM, |total|-LIM, 0)` 方向+幅值全覆盖 |
-| execute → model → 真实状态 | 规划/仿真解耦，模型返回摩擦圆限幅后的真实加速度 |
+| `compute_g_values/summary` | 约束公式同源，reporting 不会跟约束不同步 |
+| `build_context()` | ctx 构造统一入口，不再手写字典 |
+| `FrenetState` dataclass | 类型安全，`.to_ctx()` 直接生成 ctx 条目 |
+| `build_solver()` | Constran + solver + best-x 一站，warm_start 继承 GMM |
+| execute → model → 真实状态 | 规划/仿真解耦，摩擦圆限幅后的真实加速度写回 state |
 
 ## 依赖
 

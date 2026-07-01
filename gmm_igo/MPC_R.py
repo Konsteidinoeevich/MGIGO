@@ -76,9 +76,11 @@ def _update_step_reuse_k(
     denominators = vmap(get_denom, in_axes=(0, 0))(all_samples, jnp.arange(N_total))
     denominators = jnp.clip(denominators, a_min=1e-10) # 防止分母为 0
 
-    # 3. 计算 \tilde{a}_{i,(b)}^{t}
-    a_tilde_i = p_i_t / denominators
-    a_tilde_K = p_K_t / denominators
+    # 3. 计算 a_tilde: log-space clip 然后 exp (对齐 M22, 防止数值爆炸)
+    log_a_tilde_i = jnp.clip(jnp.log(p_i_t + 1e-15) - jnp.log(denominators), -20.0, 20.0)
+    a_tilde_i = jnp.exp(log_a_tilde_i)
+    log_a_tilde_K = jnp.clip(jnp.log(p_K_t + 1e-15) - jnp.log(denominators), -20.0, 20.0)
+    a_tilde_K = jnp.exp(log_a_tilde_K)
 
     weighted_factor = is_selected / N_total
 

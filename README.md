@@ -32,21 +32,23 @@ for global optima in continuous, discrete, or mixed decision spaces.
 
 | Problem Type | Solver | Constraint Engine |
 |-------------|--------|-------------------|
-| Unconstrained continuous optimization | MPCsolverM22, blockwise_mgigo | `build_unconstrained()` |
-| Deterministic constraints (g(x) ≤ 0) | MPCsolverM22 | `Deterministic` |
-| Chance constraints (P(safe) ≥ 95%) | MPCsolverM22 | `Chance` |
-| Robust constraints (∀ξ ∈ Ξ) | MPCsolverM22 | `Robust` |
-| Distributionally robust (worst distribution) | MPCsolverM22 | `DRO` |
-| Mixed constraints + priorities | MPCsolverM22 | `build()` |
+| Unconstrained continuous optimization | `build_solver(…, solver="m22")` | `build_unconstrained()` |
+| Deterministic constraints (g(x) ≤ 0) | `build_solver(…, constraints=…)` | `Deterministic` |
+| Chance constraints (P(safe) ≥ 95%) | `build_solver(…, constraints=…)` | `Chance` |
+| Robust constraints (∀ξ ∈ Ξ) | `build_solver(…, constraints=…)` | `Robust` |
+| Distributionally robust (worst distribution) | `build_solver(…, constraints=…)` | `DRO` |
+| Mixed constraints + priorities | `build_solver(…, constraints=…)` | `build()` |
 | Discrete-continuous hybrid | MPC_discrete_variables, Pure_discrete | `build()` |
 | TSP / permutation optimization | TSP (Plackett-Luce) | — |
-| Receding-horizon MPC (obstacle/tracking) | MPCsolverM22, MPCsolver | `build()` |
-| Multi-agent Nash equilibrium | MPC_G, MPC_G_MS | `build_multi_agent()` |
-| Block-structured optimization | blockwise_mgigo | `build()` |
+| Receding-horizon MPC (obstacle/tracking) | `build_solver(…, warm_start=…)` | `build()` |
+| Multi-agent Nash equilibrium | `build_nash_solver(…)` | `build_multi_agent()` |
+| Block-structured optimization | `build_solver(…, dims=(d1,d2,…))` | `build()` |
 | MCTS-guided combinatorial optimization | MCTSIGO | `build()` |
 
 ### Key Features
 
+- **Unified API**: `build_solver()` / `build_nash_solver()` — one call builds
+  everything, auto‑selects the right solver
 - **Black-box friendly**: no gradients needed — only f(x) values
 - **Numerically stable**: log-transform + saturation nesting, full-range
   distinguishability in float32
@@ -64,26 +66,30 @@ for global optima in continuous, discrete, or mixed decision spaces.
 
 ### 2.1 Solver Inventory
 
-All solvers live in [gmm_igo/](gmm_igo/). The recommended primary solver is
-**MPCsolverM22**.
+All solvers live in [gmm_igo/](gmm_igo/).  The recommended entry point is
+**[solver_builder.py](gmm_igo/solver_builder.py)** — a unified `build_solver()` /
+`build_nash_solver()` API that auto‑selects the right solver, handles
+initialisation, and integrates with Constran.  See [§7](#7-quick-start) for usage.
 
 #### Primary Production Solvers
 
 | Solver | File | Role |
 |--------|------|------|
-| `mmog_igo_optimizer_mpc` | [MPCsolverM22.py](gmm_igo/MPCsolverM22.py) | **Main workhorse** — multi-block IGO, weight clipping, `lax.scan` acceleration, dimension masking |
+| `build_solver(…, solver="m22")` | [MPCsolverM22.py](gmm_igo/MPCsolverM22.py) | **Main workhorse** — multi‑block IGO, weight clipping, `lax.scan` acceleration |
+| `build_solver(…, solver="m23")` | [MPCsolverM23.py](gmm_igo/MPCsolverM23.py) | M22 + exploration precision reset |
+| `build_solver(…, solver="reuse_single")` | [MPC_R.py](gmm_igo/MPC_R.py) | Single‑block with old‑sample importance‑weighted reuse |
+| `build_solver(…, solver="reuse_multi")` | [MPC_Rblockwise.py](gmm_igo/MPC_Rblockwise.py) | Multi‑block with old‑sample reuse |
 | `igo_mog_optimizer` | [MPCsolver.py](gmm_igo/MPCsolver.py) | Base solver, simpler interface |
-| `mmog_igo_optimizer_mpc` (M23) | [MPCsolverM23.py](gmm_igo/MPCsolverM23.py) | M22 + exploration precision reset |
-| `blockwise_mgigo` | [blockwise_mgigo.py](gmm_igo/blockwise_mgigo.py) | Block-structured MGIGO with auto dimension partitioning |
+| `blockwise_mgigo` | [blockwise_mgigo.py](gmm_igo/blockwise_mgigo.py) | Block‑structured MGIGO with auto dimension partitioning |
 
 #### Multi-Agent / Game-Theoretic Solvers
 
 | Solver | File | Role |
 |--------|------|------|
-| `mmog_igo_rne_solver` | [MPC_G.py](gmm_igo/MPC_G.py) | Nash equilibrium with MC inner loop, sample reuse |
-| `mmog_igo_rne_solver` (S variant) | [MPC_G_S.py](gmm_igo/MPC_G_S.py) | Single-block GMM update for RNE |
-| `mmog_igo_rne_blocks_solver` | [MPC_G_MS.py](gmm_igo/MPC_G_MS.py) | **Multi-block multi-agent** mixed strategies |
-| Tracking variant | [MPC_G_S_V.py](gmm_igo/MPC_G_S_V.py) | Blockwise RNE with metrics tracking |
+| `build_nash_solver(…, solver="rne")` | [MPC_G.py](gmm_igo/MPC_G.py) | Nash equilibrium with MC inner loop |
+| `build_nash_solver(…, solver="rne_single")` | [MPC_G_S.py](gmm_igo/MPC_G_S.py) | Single‑block GMM update for RNE |
+| `build_nash_solver(…, solver="rne_blocks")` | [MPC_G_MS.py](gmm_igo/MPC_G_MS.py) | **Multi‑block multi‑agent** mixed strategies |
+| `build_nash_solver(…, solver="rne_single_verbose")` | [MPC_G_S_V.py](gmm_igo/MPC_G_S_V.py) | RNE with per‑iteration metrics tracking |
 
 #### Discrete / Mixed-Integer Solvers
 
@@ -93,14 +99,6 @@ All solvers live in [gmm_igo/](gmm_igo/). The recommended primary solver is
 | Refined hybrid | [MPC_discrete_variable1.py](gmm_igo/MPC_discrete_variable1.py) | Separate step sizes for continuous vs discrete blocks |
 | Pure discrete | [Pure_discrete.py](gmm_igo/Pure_discrete.py) | Categorical block updates only |
 | TSP / permutations | [TSP.py](gmm_igo/TSP.py) | Plackett-Luce permutation model, sequential masked sampling |
-
-#### Sample Reuse Variants
-
-| Solver | File | Role |
-|--------|------|------|
-| Sample reuse | [MPC_ReuseOldSamples.py](gmm_igo/MPC_ReuseOldSamples.py) | Cholesky-parameterized IGO with old-sample importance weighting |
-| Blockwise reuse | [MPC_Rblockwise.py](gmm_igo/MPC_Rblockwise.py) | Blockwise version with dimension masking |
-| Weight reset | [MPCresetweight.py](gmm_igo/MPCresetweight.py) | Strict Algorithm 3/4 alignment, full reset strategy |
 
 #### Multi-Problem / Multi-Objective
 
@@ -432,25 +430,22 @@ uv run python Cartest/Simple.py
 ### 7.3 Minimal Example — Unconstrained
 
 ```python
-import jax.numpy as jnp
-from gmm_igo.MPCsolverM22 import mmog_igo_optimizer_mpc
+import jax, jax.numpy as jnp
+from gmm_igo.solver_builder import build_solver
 
 def my_cost(x, ctx):
     return (x[0] - 3.0)**2 + (x[1] + 2.0)**2
 
-result = mmog_igo_optimizer_mpc(
-    key, T=200, dt=0.1, M=1, K=3, B=80, B0=40,
-    dims=[2], T_0=50,
-    fitness_fn_total=my_cost,
-    initial_mu_k=mu, initial_L_inv_k=L_inv, initial_v_k=v,
-    context=None,
-)
+solver = build_solver(my_cost, dims=(2,), T=200, dt=0.1, K=3)
+result = solver(jax.random.PRNGKey(0))
+print(result.x, result.cost)   # ≈ [3, -2], 0
 ```
 
 ### 7.4 Minimal Example — Constrained
 
 ```python
-from Constraintdealer.Constran import *
+from Constraintdealer.Constran import Deterministic, autodelta
+from gmm_igo.solver_builder import build_solver
 
 constraints = autodelta([
     Deterministic(lambda x, ctx: x[0] + x[1] + 4,     # x + y ≥ -4
@@ -459,28 +454,41 @@ constraints = autodelta([
                   mode='hard', priority=2),
 ])
 
-cost_fn = build(lambda x, ctx: ((x[0]-6)**2 + (x[1]+4)**2) / 50, constraints)
-result = mmog_igo_optimizer_mpc(..., fitness_fn_total=cost_fn, ...)
+solver = build_solver(
+    lambda x, ctx: ((x[0]-6)**2 + (x[1]+4)**2) / 50,
+    dims=(2,), constraints=constraints, T=300,
+)
+result = solver(key)
 ```
 
-### 7.5 Minimal Example — Multi-Agent
+### 7.5 Minimal Example — Multi-Agent Nash
 
 ```python
-from Constraintdealer.Constran import build_multi_agent
-from gmm_igo.MPC_G_MS import mmog_igo_rne_blocks_solver
+from gmm_igo.solver_builder import build_nash_solver
 
-agent_fns = build_multi_agent({
+solver = build_nash_solver({
     0: (lambda x, ctx: jnp.sum((x[:2] - ctx['t0'])**2), []),
     1: (lambda x, ctx: jnp.sum((x[2:] - ctx['t1'])**2), []),
-})
+}, dims=(2, 2), block_to_agent=[0, 1], T=150, M_inner=30)
 
-result = mmog_igo_rne_blocks_solver(
-    key, T=150, dt=0.15, N_blocks=2, M_agent=2, K=3,
-    B=80, B0=40, dims=[2, 2], T_0=50,
-    fitness_fn_j=agent_fns,
-    block_to_agent_idx=jnp.array([0, 1]),
-    ...
-)
+result = solver(key, context={'t0': t0, 't1': t1})
+# result.solutions[0].x  — agent 0's best action
+# result.per_agent_cost   — real evaluated costs
+```
+
+### 7.6 Minimal Example — MPC Warm‑Start
+
+```python
+solver = build_solver(my_cost, dims=(9, 9), solver='m22',
+                      T=500, dt=0.15, K=3)
+
+for step in range(steps):
+    ctx = {'s0': s0, 'd0': d0, ...}
+    # Physics‑based warm‑start from current state
+    mu_init = tangent_warmstart(gen, s0, v_target)
+    result = solver(key, context=ctx, initial_mu=mu_init)
+    # … or carry forward the previous GMM:
+    # result = solver(key, context=ctx, warm_start=prev_result)
 ```
 
 ---
@@ -491,19 +499,21 @@ result = mmog_igo_rne_blocks_solver(
 gmm_igo/
 │
 ├── gmm_igo/                              # Core solvers (JAX)
-│   ├── MPCsolverM22.py                   # ★ Main solver (recommended)
+│   ├── solver_builder.py                 # ★ Unified entry point (recommended)
+│   ├── MPCsolverM22.py                   # Main workhorse solver
 │   ├── MPCsolverM23.py                   # M22 + exploration reset
 │   ├── MPCsolver.py                      # Base solver
 │   ├── blockwise_mgigo.py                # Block-structured MGIGO
+│   ├── MPC_R.py                          # Single-block sample-reuse IGO
+│   ├── MPC_Rblockwise.py                 # Multi-block sample-reuse IGO
 │   ├── MPC_G.py                          # Multi-agent Nash (RNE)
 │   ├── MPC_G_S.py                        # Single-block RNE
+│   ├── MPC_G_S_V.py                      # RNE with metrics tracking
 │   ├── MPC_G_MS.py                       # Multi-block multi-agent RNE
 │   ├── TSP.py                            # Permutation optimization
 │   ├── Pure_discrete.py                  # Categorical IGO
 │   ├── MPC_discrete_variables.py         # Discrete-continuous hybrid
 │   ├── MPC_discrete_variable1.py         # Refined hybrid
-│   ├── MPC_ReuseOldSamples.py            # Sample-reuse IGO
-│   ├── MPC_R.py / MPC_Rblockwise.py      # Reuse variants
 │   ├── MPCresetweight.py                 # Weight-reset solver
 │   ├── MPCsolvermultipleproblems.py      # Batched multi-problem
 │   ├── MPCsolver_differentobjects.py     # Multi-objective IGO

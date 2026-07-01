@@ -11,6 +11,33 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Context builder
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_context(gen, state, v_ref, lane_hw, obs_pos, obs_rad):
+    """Build ctx dict for cost/constraint evaluation.
+
+    Args:
+        gen:     FrenetBSplineTrajectory
+        state:   FrenetState
+        v_ref:   scalar or [T] reference speed
+        lane_hw: scalar lane half‑width
+        obs_pos: [N, 2], obs_rad: [N]
+    """
+    return {
+        'v_ref':   jnp.full(gen.T, v_ref) if isinstance(v_ref, (int, float)) else v_ref,
+        'lane_hw': lane_hw,
+        'obs_pos': obs_pos,
+        'obs_rad': obs_rad,
+        **state.to_ctx(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Objective
+# ═══════════════════════════════════════════════════════════════════════
+
 def _eval_all(theta, ctx, gen):
     """Unpack theta → Frenet trajectory → vehicle states.
 
@@ -26,28 +53,19 @@ def _eval_all(theta, ctx, gen):
         ctx["d0"], ctx["d_dot0"], ctx["d_ddot0"],
     )
 
-    # Vehicle states [T, 9]: x, y, v, ψ, a_long, a_lat, j_long, j_lat, steer
     st = gen.to_vehicle_states(s, d, s_dot, d_dot,
                                s_ddot, d_ddot, s_dddot, d_dddot)
-    v = st[:, 2]  # total speed (with (1-d·κ_r) correction)
+    v = st[:, 2]
     return d, v
 
 
 def make_objective(gen):
-    """Build objective: d → 0 (lane centre) + v → v_target.
-
-    Smoothness is natively provided by the B-spline C⁴ continuity.
-    """
+    """Build objective: d → 0 (lane centre) + v → v_target."""
 
     def obj_fn(theta, ctx):
         d, v = _eval_all(theta, ctx, gen)
-
-        # Speed tracking: total speed → target
         speed_cost = jnp.sum((v - ctx["v_ref"]) ** 2)
-
-        # Lateral tracking: Frenet d → 0 (lane centre)
         lat_cost = jnp.sum(d ** 2)
-
         return speed_cost + lat_cost
 
     return obj_fn

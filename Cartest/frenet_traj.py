@@ -97,6 +97,28 @@ class FrenetBSplineTrajectory:
         )
 
     # ═══════════════════════════════════════════════════════════════════
+    # One-shot plan evaluation
+    # ═══════════════════════════════════════════════════════════════════
+
+    def evaluate_plan(self, ctrl_s_free, ctrl_d_free, ctx):
+        """Evaluate B-spline → Frenet + vehicle states + Cartesian.
+
+        Returns (frenet, vehicle_states, (x, y)) where:
+          frenet = (s, d, s_dot, d_dot, s_ddot, d_ddot, s_dddot, d_dddot)
+          vehicle_states = [T, 9]
+          (x, y) = Cartesian positions [T] each
+        """
+        s, d, s_dot, d_dot, s_ddot, d_ddot, s_dddot, d_dddot = self.evaluate(
+            ctrl_s_free, ctrl_d_free,
+            ctx["s0"], ctx["s_dot0"], ctx["s_ddot0"],
+            ctx["d0"], ctx["d_dot0"], ctx["d_ddot0"],
+        )
+        st = self.to_vehicle_states(
+            s, d, s_dot, d_dot, s_ddot, d_ddot, s_dddot, d_dddot)
+        x, y = self.to_cartesian(s, d)
+        return (s, d, s_dot, d_dot, s_ddot, d_ddot, s_dddot, d_dddot), st, (x, y)
+
+    # ═══════════════════════════════════════════════════════════════════
     # Cartesian mapping (via reference path) — obstacle checking
     # ═══════════════════════════════════════════════════════════════════
 

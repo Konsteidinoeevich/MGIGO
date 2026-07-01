@@ -1,16 +1,36 @@
 """Execution: bridge from plan to vehicle model.
 
-1. Extract commanded acceleration from the plan at t=0.
+1. Extract commanded acceleration from the plan at t=dt.
 2. Pass to vehicle model for forward simulation.
-3. Return the model's full next state — execute trusts the model.
+3. Return a FrenetState with the model's full next state.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+
+@dataclass
+class FrenetState:
+    """Frenet vehicle state — position, velocity, acceleration."""
+    s:      float
+    s_dot:  float
+    s_ddot: float
+    d:      float
+    d_dot:  float
+    d_ddot: float
+
+    def to_ctx(self):
+        """Convert to ctx dict entries for cost/constraint evaluation."""
+        return {
+            's0': self.s, 's_dot0': self.s_dot, 's_ddot0': self.s_ddot,
+            'd0': self.d, 'd_dot0': self.d_dot, 'd_ddot0': self.d_ddot,
+        }
+
 
 def execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot,
-                 vehicle_model):
-    """Plan → vehicle model → next Frenet state.
+                 vehicle_model) -> FrenetState:
+    """Plan → vehicle model → next FrenetState.
 
     Args:
         gen:   FrenetBSplineTrajectory
@@ -18,9 +38,9 @@ def execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot,
         vehicle_model: object with step(s0,d0,s_dot0,d_dot0,cmd_s,cmd_d)
 
     Returns:
-        dict: {s0, s_dot0, s_ddot0, d0, d_dot0, d_ddot0}
+        FrenetState with the vehicle model's actual (clipped) acceleration.
     """
-    # 1. Plan's intended acceleration (t=dt, after clamped boundary releases)
+    # 1. Plan's intended acceleration at t=dt
     s_ddot_cmd = float(s_ddot[1])
     d_ddot_cmd = float(d_ddot[1])
 
@@ -31,12 +51,8 @@ def execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot,
         s_ddot_cmd, d_ddot_cmd,
     )
 
-    # 3. Return model's output as next state
-    return {
-        's0':      s_new,
-        's_dot0':  s_dot_new,
-        's_ddot0': float(ax),
-        'd0':      d_new,
-        'd_dot0':  d_dot_new,
-        'd_ddot0': float(ay),
-    }
+    # 3. Return model's actual state
+    return FrenetState(
+        s=s_new, s_dot=s_dot_new, s_ddot=float(ax),
+        d=d_new, d_dot=d_dot_new, d_ddot=float(ay),
+    )

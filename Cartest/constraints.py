@@ -131,3 +131,73 @@ def make_constraints(gen):
         Deterministic(jerk_g,  mode='soft', priority=5, aggregate='max',
                       transform='soft'),
     ]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Metrics — reusable g‑value computation (matches constraint formulas)
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad):
+    """Compute per‑constraint g‑values for reporting.
+
+    Args:
+        st:      [T, 9] vehicle states
+        d:       [T] Frenet lateral offset
+        x_cart, y_cart: [T] Cartesian positions
+        obs_pos: [N, 2], obs_rad: [N]
+
+    Returns:
+        dict with keys lane, obs, jerk, acc, speed (all scalars, q90).
+    """
+    v = st[:, 2]
+    a_long, a_lat = st[:, 4], st[:, 5]
+    j_long, j_lat = st[:, 6], st[:, 7]
+    am = jnp.sqrt(a_long ** 2 + a_lat ** 2)
+    jm = jnp.sqrt(j_long ** 2 + j_lat ** 2)
+
+    g_lane = jnp.quantile(jnp.maximum(0., jnp.abs(d) - LANE_HW), 0.9)
+
+    dist = jnp.sqrt((x_cart[:, None] - obs_pos[None, :, 0]) ** 2 +
+                    (y_cart[:, None] - obs_pos[None, :, 1]) ** 2)
+    pen = jnp.maximum(0., OBS_SAFE_DIST + obs_rad[None, :] - dist)
+    g_obs = jnp.quantile(jnp.min(pen, axis=-1), 0.9)
+
+    g_jerk = jnp.quantile(
+        jnp.maximum(
+            jnp.maximum(0., jnp.abs(j_long) - JERK_MAX),
+            jnp.maximum(jnp.maximum(0., jnp.abs(j_lat) - JERK_MAX),
+                        jnp.maximum(0., jm - JERK_MAX)),
+        ), 0.9)
+
+    g_acc = jnp.quantile(
+        jnp.maximum(
+            jnp.maximum(0., jnp.abs(a_long) - ACC_MAX),
+            jnp.maximum(jnp.maximum(0., jnp.abs(a_lat) - ACC_MAX),
+                        jnp.maximum(0., am - ACC_MAX)),
+        ), 0.9)
+
+    g_spd = jnp.quantile(
+        jnp.maximum(jnp.maximum(0., V_MIN - v), jnp.maximum(0., v - V_MAX)), 0.9)
+
+    return {
+        'lane': float(g_lane), 'obs': float(g_obs),
+        'jerk': float(g_jerk), 'acc': float(g_acc), 'spd': float(g_spd),
+    }
+
+
+def compute_summary(st, d, x_cart, y_cart, obs_pos, obs_rad):
+    """Compute summary metrics: min_obs_dist, max |a_long|, |a_lat|, |jerk|."""
+    a_long, a_lat = st[:, 4], st[:, 5]
+    j_long, j_lat = st[:, 6], st[:, 7]
+    jm = jnp.sqrt(j_long ** 2 + j_lat ** 2)
+
+    dist = jnp.sqrt((x_cart[:, None] - obs_pos[None, :, 0]) ** 2 +
+                    (y_cart[:, None] - obs_pos[None, :, 1]) ** 2) - obs_rad[None, :]
+
+    return {
+        'min_obs': float(jnp.min(dist)),
+        'max_a_long': float(jnp.max(jnp.abs(a_long))),
+        'max_a_lat':  float(jnp.max(jnp.abs(a_lat))),
+        'max_jerk':   float(jnp.max(jm)),
+        'v':          float(st[0, 2]),
+    }
