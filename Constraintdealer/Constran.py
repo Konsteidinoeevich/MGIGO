@@ -190,81 +190,8 @@ DELTA_PRESETS = {
 }
 
 # --- Tunable presets: (β, δ_soft) ---
-# k deprecated: self-similar nesting uses σ_1 throughout
-
-NEAR_HARD_BETA = 8.0  # β=8: 硬约束, ratio≈0.73
-
-TUNE_PRESETS = {
-    'mild':     (0.15, 0.5),  # ratio: S≈0.00 T≈0.03 H≈0.13 — 跟内层竞争
-    'standard': (0.5,  0.7),  # ratio: S≈0.01 T≈0.04 H≈0.16
-    'firm':     (1.0,  0.75), # ratio: S≈0.01 T≈0.05 H≈0.20
-    'strong':   (2.5,  0.8),  # ratio: S≈0.01 T≈0.09 H≈0.33
-    'nearhard': (8.0,  1.0),  # ratio: S≈0.04 T≈0.25 H≈0.73 — 近硬
-    '__hard__': (20.0, 1.2),  # ratio: S≈0.11 T≈0.58 H≈1.05 — 严格优先(极少用)
-    '__tunable_default__': (0.5, 0.7),
-}
-
-
-# --- Per-layer k calibration ---
-# Geometric taper ensures ∏k_i ≥ target_gain for float32 survival
-# while outer layers keep k≈k_outer for strong priority gradient.
-# Once inner layers hit k=1.0, additional layers cost NOTHING (gain×1=1).
-# This makes the nesting depth-proof for small signals.
-
-def auto_calibrate_k(n_layers: int,
-                     k_outer: float = 0.2,
-                     target_gain: float = 0.003,
-                     ) -> list:
-    """Compute per-layer k values via geometric taper (innermost→outermost).
-
-    Returns k values in the same order as ``_assemble_nest`` layers:
-    ``ks[0]`` = innermost layer (largest k), ``ks[-1]`` = outermost (smallest k).
-
-    Parameters
-    ----------
-    n_layers : int
-        Number of constraint layers.
-    k_outer : float
-        k for the outermost layer. Default 0.2 (knee at T=5, ~3 decades range).
-    target_gain : float
-        Minimum product ∏k_i. Default 0.003 ensures ~1000× f32 resolution
-        at the innermost layer even for small violations (ΔT ≈ 0.002).
-
-    Returns
-    -------
-    ks : list of float
-        Per-layer k, innermost first. Clipped to [k_outer, 1.0].
-    """
-    if n_layers <= 1:
-        return [k_outer]
-
-    # Geometric taper: k_i = k_outer × r^(n-1-i) for i=0..n-1 (innermost..outermost)
-    # Product = k_outer^n × r^{n(n-1)/2}
-    # Solve for r: r = (target_gain / k_outer^n)^{2/(n(n-1))}
-    exponent = 2.0 / (n_layers * (n_layers - 1))
-    r = (target_gain / (k_outer ** n_layers)) ** exponent
-    r = max(1.0, r)  # r<1 would invert priority gradient
-
-    ks = []
-    for i in range(n_layers):
-        k_i = k_outer * r ** (n_layers - 1 - i)
-        ks.append(float(min(1.0, max(k_outer, k_i))))
-    return ks
-
-
-def _rescale_transform_table(knots_g, knots_T,
-                             k_i: float,
-                             k_ref: float = 0.2):
-    """Rescale T-values for layer with σ_{k_i} so σ(T(g)) stays in non-saturated region.
-
-    T_new = T_old × (k_ref / k_i).  This keeps σ_{k_i}(T_max) ≈ σ_{k_ref}(T_max_original).
-
-    Returns (knots_g, knots_T_new).  If k_i == k_ref, returns original table.
-    """
-    if abs(k_i - k_ref) < 1e-10:
-        return (np.array(knots_g), np.array(knots_T))
-    scale = k_ref / k_i
-    return (np.array(knots_g), np.array(knots_T) * scale)
+# baseline 硬度旋钮 (0~2) 替代了 β/δ preset
+# 见 ConstraintSpec.baseline
 
 
 @jax.jit
@@ -282,70 +209,34 @@ def sigma_k(x: jnp.ndarray, k: float = 1.0) -> jnp.ndarray:
 class ConstraintSpec:
     mode: str = 'soft'
     priority: int = 1
-    baseline: Optional[float] = None        # 0=SOFT, 1=TUNABLE, 2=HARD (auto from mode)
-    delta: Optional[float] = None           # scalar δ (legacy / simple)
-    delta_table: str = 'none'               # preset for δ(g), or 'none'
-    _delta_table_raw: Optional[Tuple] = None  # custom (knots_g, knots_d)
-    delta_soft: Optional[float] = None
-    beta: Optional[float] = None
-    tune_preset: str = 'none'               # preset for (β, δ_soft), or 'none'
+    baseline: Optional[float] = None        # 硬度旋钮 (auto: soft=0.5, tunable=1.3, hard=2.0)
     transform: str = ''  # '' = auto-detect from mode
     _transform_table: Optional[Tuple] = None
     aggregate: str = ''  # '' = sum/identity; 'mean','max','q90','q95','q99','count'
 
     def __post_init__(self):
-        # Normalize: 'hard' → 'tunable' with extreme β, baseline=2.0
+        # Normalize: 'hard'/'tunable'/'soft' → baseline auto-set
         if self.mode == 'hard':
-            self.mode = 'tunable'
-            if self.baseline is None:
-                self.baseline = 2.0
-            if self.delta is not None and self.delta_soft is None:
-                self.delta_soft = self.delta
-            if self.beta is None:
-                self.beta = NEAR_HARD_BETA
-            if self.tune_preset == 'none':
-                self.tune_preset = '__hard__'
-        if self.mode not in ('soft', 'tunable'):
-            raise ValueError(f"mode must be 'soft' or 'tunable', got {self.mode!r}")
-        # Auto-detect baseline from mode if not explicitly set
-        if self.baseline is None:
-            self.baseline = 0.0 if self.mode == 'soft' else 1.0
+            self.baseline = 2.0 if self.baseline is None else self.baseline
+        elif self.mode == 'tunable':
+            self.baseline = 1.3 if self.baseline is None else self.baseline
+        elif self.mode == 'soft':
+            self.baseline = 0.5 if self.baseline is None else self.baseline
+        else:
+            raise ValueError(f"mode must be 'soft', 'tunable', or 'hard', got {self.mode!r}")
         # Auto-detect transform from mode if not explicitly set
         if not self.transform:
             self.transform = DEFAULT_TRANSFORM.get(self.mode, 'standard')
-        # Auto-detect tune_preset for tunable mode if not explicitly set
-        if self.mode == 'tunable' and self.tune_preset == 'none' and self.beta is None:
-            self.tune_preset = '__tunable_default__'
         if self.transform not in TRANSFORM_PRESETS and self._transform_table is None:
             raise ValueError(
                 f"Unknown transform preset: {self.transform!r}. "
                 f"Available: {list(TRANSFORM_PRESETS.keys())}.")
-        if self.mode == 'tunable' and self.tune_preset not in TUNE_PRESETS and self.tune_preset != 'none':
-            raise ValueError(
-                f"Unknown tune_preset: {self.tune_preset!r}. "
-                f"Available: {list(TUNE_PRESETS.keys())}.")
 
     def get_transform_table(self):
         if self._transform_table is not None:
             return self._transform_table
         return TRANSFORM_PRESETS[self.transform]
 
-    def get_delta_table(self):
-        if self._delta_table_raw is not None:
-            return self._delta_table_raw
-        return DELTA_PRESETS[self.delta_table]
-
-    def get_tune_params(self):
-        if self.tune_preset not in ('none', '__hard__', '__tunable_default__'):
-            return TUNE_PRESETS[self.tune_preset]
-        if self.tune_preset == '__hard__':
-            return (0.3,
-                    self.delta_soft if self.delta_soft is not None else 1.0)
-        if self.tune_preset == '__tunable_default__':
-            return TUNE_PRESETS['__tunable_default__']
-        # 'none': user explicitly set beta/delta_soft
-        return (self.beta if self.beta is not None else 0.3,
-                self.delta_soft if self.delta_soft is not None else 0.7)
 
 
 @dataclass
@@ -505,16 +396,15 @@ def _assemble_nest(objective_fn: Callable,
         for _priority, mode, params, viol_fn, T_fn in layers:
             baseline = params.get('baseline', 0.0)
             g_raw = viol_fn(x, ctx)
-            t_val = jnp.maximum(0.0, T_fn(g_raw))     # 精确罚: 只罚违规
+            t_val = jnp.maximum(0.0, T_fn(g_raw))      # 精确罚: 只罚违规
 
-            if mode == 'tunable':
-                delta_soft = params.get('delta_soft', 0.7)
-                beta = params.get('beta', 0.5)
-                Phi = baseline + t_val + delta_soft * sigma_k(beta * t_val, k=1.0)
-            else:  # 'soft'
-                Phi = baseline + t_val
+            # Φ = exact penalty + baseline (when violated)
+            Phi = t_val
+            resolution = params.get('resolution', 0.0)
+            violated = jnp.maximum(0.0, g_raw) > resolution
+            Phi = jnp.where(violated, Phi + baseline, Phi)
 
-            inner = M * sigma_k(inner, k=1.0) + Phi    # constraint layer
+            inner = M * sigma_k(inner, k=1.0) + Phi     # constraint layer
 
         inner = M * sigma_k(inner, k=1.0)              # final σ·m — output bounded to (-√2, √2)
         return inner
@@ -579,11 +469,8 @@ def build(objective_fn: Callable[[jnp.ndarray, Any], jnp.ndarray],
         table = spec.get_transform_table()
         T_fn = _make_transform_fn(*table) if table is not None else _make_transform_fn(None, None)
 
-        params = {'baseline': spec.baseline}
-        if spec.mode == 'tunable':
-            beta, ds = spec.get_tune_params()
-            params['delta_soft'] = ds
-            params['beta'] = beta
+        params = {'baseline': spec.baseline,
+                  'resolution': table[0][0] if table is not None else 0.0}
 
         layers.append((spec.priority, spec.mode, params, viol_fn, T_fn))
 
@@ -691,15 +578,10 @@ def _validate_constraints(constraints: Sequence[ConstraintSpec]) -> None:
 
 
 def autodelta(constraints: Sequence[ConstraintSpec]) -> List[ConstraintSpec]:
-    """Auto-assign δ: outermost hard gets 1.5, inner gets 0.5."""
-    hard_specs = [s for s in constraints if s.mode in ('hard', 'tunable') and s.delta_soft is None]
-    if hard_specs:
-        min_prio = min(s.priority for s in hard_specs)
-        for spec in hard_specs:
-            if spec.mode == 'tunable' and spec.tune_preset == '__hard__':
-                spec.delta_soft = 1.5 if spec.priority == min_prio else 0.5
-            elif spec.mode == 'tunable' and spec.beta is None:
-                spec.beta = 0.3  # tunable default
+    """Auto-assign baseline: hard=2.0, tunable=1.0, soft=0.0 (deprecated, baseline auto-set)."""
+    for spec in constraints:
+        if spec.baseline is None:
+            spec.baseline = {'hard': 2.0, 'tunable': 1.0, 'soft': 0.0}.get(spec.mode, 0.0)
     return list(constraints)
 
 
@@ -710,9 +592,8 @@ def autodelta(constraints: Sequence[ConstraintSpec]) -> List[ConstraintSpec]:
 if __name__ == "__main__":
     print("=== Constran Self-Test ===\n")
 
-    print("--- Modes: only 'soft' and 'tunable' ---")
-    print(f"  'hard' → auto-mapped to 'tunable' + β={NEAR_HARD_BETA}")
-    print("  Tune presets:", *[f"{k}(β={v[0]},δ={v[1]})" for k,v in TUNE_PRESETS.items()])
+    print("--- Self-similar σ nesting: obj/√2ⁿ⁺¹ → σₖ → [√2·σ₁ + Φ] × n → √2·σ₁ ---")
+    print("  Φ = max(0,T(g)) + baseline  (default: SOFT=0.5, TUNABLE=1.3, HARD=2.0)")
     print()
 
     def obj(x, ctx): return jnp.sum((x - 3.0)**2)
@@ -720,35 +601,21 @@ if __name__ == "__main__":
     def viol2(x, ctx): return x[0] - 5.0      # x<=5
     ctx = {}
 
-    # Test: hard → tunable auto-mapping
-    print(f"--- mode='hard' auto-mapped to tunable β={NEAR_HARD_BETA} ---")
-    for hspec, label in [
-        (dict(mode='hard', priority=1, delta=0.5, transform='standard'), "hard δ=0.5"),
-        (dict(mode='hard', priority=1, delta=1.5, transform='standard'), "hard δ=1.5"),
-        (dict(mode='tunable', priority=1, tune_preset='nearhard', transform='standard'), "tunable nearhard"),
-    ]:
-        cost = build(obj, [Deterministic(viol, **hspec)], jit_cost=False)
+    # Test: baseline spectrum
+    print("--- baseline spectrum: 0(soft) → 2(hard) ---")
+    for bl, label in [(0.0, "bl=0 soft"), (0.5, "bl=0.5"), (1.0, "bl=1.0 tunable"),
+                       (1.5, "bl=1.5"), (2.0, "bl=2.0 hard")]:
+        cost = build(obj, [Deterministic(viol, mode='tunable', priority=1,
+                                         baseline=bl, transform='standard')], jit_cost=False)
         c0 = float(cost(jnp.array([0.0]), ctx))
         c_ok = float(cost(jnp.array([2.0]), ctx))
         print(f"  {label:20s}: violated→{c0:.4f}, satisfied→{c_ok:.4f}, gap={c0-c_ok:.4f}")
 
-    # Test: full β spectrum from soft to hard
-    print("\n--- β spectrum: 0.1(soft) → 1e7(hard) ---")
-    for beta, label in [(0.1, "β=0.1 soft"), (0.5, "β=0.5"), (1.0, "β=1"),
-                         (5.0, "β=5"), (100.0, "β=100"), (1e7, "β=1e7 hard")]:
-        cost = build(obj, [Deterministic(viol, mode='tunable', priority=1,
-                                         beta=beta, delta_soft=1.5,
-                                         transform='standard')], jit_cost=False)
-        c0 = float(cost(jnp.array([0.0]), ctx))
-        c_tiny = float(cost(jnp.array([0.999]), ctx))
-        c_ok = float(cost(jnp.array([2.0]), ctx))
-        print(f"  {label:15s}: viol={c0:.4f}, tiny={c_tiny:.4f}, ok={c_ok:.4f}")
-
     # Hierarchy test
-    print("\n--- 3-level hierarchy (all tunable) ---")
+    print("\n--- 3-level hierarchy ---")
     cost = build(obj, [
-        Deterministic(viol, mode='hard', priority=1, delta=1.5, transform='sharp'),
-        Deterministic(viol2, mode='tunable', priority=2, tune_preset='firm', transform='standard'),
+        Deterministic(viol, mode='hard', priority=1, transform='sharp'),
+        Deterministic(viol2, mode='tunable', priority=2, transform='standard'),
     ], jit_cost=False)
 
     c_l1 = float(cost(jnp.array([0.0]), ctx))    # inner constraint violated

@@ -12,13 +12,14 @@ from dataclasses import dataclass
 
 @dataclass
 class FrenetState:
-    """Frenet vehicle state — position, velocity, acceleration."""
+    """Vehicle state — Frenet position + velocity + acceleration + yaw."""
     s:      float
     s_dot:  float
     s_ddot: float
     d:      float
     d_dot:  float
     d_ddot: float
+    psi:    float = 0.0
 
     def to_ctx(self):
         """Convert to ctx dict entries for cost/constraint evaluation."""
@@ -29,30 +30,20 @@ class FrenetState:
 
 
 def execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot,
-                 vehicle_model) -> FrenetState:
-    """Plan → vehicle model → next FrenetState.
-
-    Args:
-        gen:   FrenetBSplineTrajectory
-        s..d_ddot: [T] evaluated trajectory
-        vehicle_model: object with step(s0,d0,s_dot0,d_dot0,cmd_s,cmd_d)
-
-    Returns:
-        FrenetState with the vehicle model's actual (clipped) acceleration.
-    """
-    # 1. Plan's intended acceleration at t=dt
+                 vehicle_model, psi0: float = 0.0) -> FrenetState:
+    """Plan → vehicle model → next FrenetState."""
     s_ddot_cmd = float(s_ddot[1])
     d_ddot_cmd = float(d_ddot[1])
 
-    # 2. Forward simulation through vehicle model
-    s_new, d_new, s_dot_new, d_dot_new, ax, ay = vehicle_model.step(
-        float(s[0]), float(d[0]),
-        float(s_dot[0]), float(d_dot[0]),
-        s_ddot_cmd, d_ddot_cmd,
-    )
+    s_new, d_new, s_dot_new, d_dot_new, s_ddot_new, d_ddot_new, psi_new = \
+        vehicle_model.step(
+            float(s[0]), float(d[0]),
+            float(s_dot[0]), float(d_dot[0]),
+            s_ddot_cmd, d_ddot_cmd, psi0,
+        )
 
-    # 3. Return model's actual state
     return FrenetState(
-        s=s_new, s_dot=s_dot_new, s_ddot=float(ax),
-        d=d_new, d_dot=d_dot_new, d_ddot=float(ay),
+        s=s_new, s_dot=s_dot_new, s_ddot=float(s_ddot_new),
+        d=d_new, d_dot=d_dot_new, d_ddot=float(d_ddot_new),
+        psi=float(psi_new),
     )

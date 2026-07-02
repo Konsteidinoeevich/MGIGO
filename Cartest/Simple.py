@@ -17,19 +17,13 @@ from Cartest.warmstart import build_initial_mu
 from Cartest.cost import make_objective, build_context
 from Cartest.execute import execute_step
 from Cartest.constraints import make_constraints, compute_g_values, compute_summary
-from Cartest.vehicle_model import FrenetVehicleModel
+from Cartest.vehicle_model import BicycleModel
 from Cartest.reporting import StepReport
 from Cartest.plotting import setup_axes, render_frame, save_animation
+from Cartest.diagnostics import diagnose, print_diag
+from Cartest.scenario import THREE_BLOCKING as scenario
 from gmm_igo.solver_builder import build_solver
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Config
-# ═══════════════════════════════════════════════════════════════════════
-
-V_TARGET = 18.0
-OBSTACLES = [{"x": 60.0, "y": 2.5, "r": 2.0}]
-LANE_HW, OBS_SAFE_DIST = 4.0, 2.0
 
 OUTPUT = Path(__file__).resolve().parent
 
@@ -43,21 +37,29 @@ def run(steps=150, seed=0, plot=True):
     gen = FrenetBSplineTrajectory(OUTPUT / "bspline_basis.npz", ref_path)
 
     # Build solver ONCE
+    # ── Scenario ──
+    obs_list  = scenario["obstacles"]
+    lane_hw   = scenario["lane_hw"]
+    safe_dist = scenario["obs_safe_dist"]
+    v_target  = scenario["v_target"]
+    obs_pos = jnp.array([[o["x"], o["y"]] for o in obs_list], dtype=jnp.float32)
+    obs_rad = jnp.array([o["r"] for o in obs_list], dtype=jnp.float32)
+
     solver = build_solver(
         make_objective(gen), dims=(gen.n_free, gen.n_free),
-        constraints=make_constraints(gen),
-        solver='m22', T=500, dt=0.15, K=3, B=64, B0=20, T_0=250,
-        k_inner=0.1, obj_transform='standard',
+        constraints=make_constraints(gen, lane_hw, safe_dist),
+        solver='m22', T=300, dt=0.15, K=3, B=100, B0=45, T_0=300,
+        k_inner=1.0, obj_transform='standard',
     )
 
-    vehicle = FrenetVehicleModel(mu=0.85, dt=gen.dt)
+    vehicle = BicycleModel(mu=0.85, dt=gen.dt)
     key = random.PRNGKey(seed)
 
     from Cartest.execute import FrenetState
-    state = FrenetState(s=0.0, s_dot=12.0, s_ddot=0.0, d=-3.0, d_dot=0.0, d_ddot=0.0)
-
-    obs_pos = jnp.array([[o["x"], o["y"]] for o in OBSTACLES], dtype=jnp.float32)
-    obs_rad = jnp.array([o["r"] for o in OBSTACLES], dtype=jnp.float32)
+    init = scenario["init"]
+    state = FrenetState(s=init["s"], s_dot=init["s_dot"], s_ddot=init["s_ddot"],
+                        d=init["d"], d_dot=init["d_dot"], d_ddot=init["d_ddot"],
+                        psi=init.get("psi", 0.0))
 
     if plot:
         fig, ax_t, ax_k = setup_axes()
@@ -68,7 +70,7 @@ def run(steps=150, seed=0, plot=True):
     for step in range(steps):
         key, sk = random.split(key)
 
-        ctx = build_context(gen, state, V_TARGET, LANE_HW, obs_pos, obs_rad)
+        ctx = build_context(gen, state, v_target, lane_hw, obs_pos, obs_rad)
         mu_init = build_initial_mu(gen, state.s, state.s_dot, state.d)
 
         t0 = time.time()
@@ -82,11 +84,11 @@ def run(steps=150, seed=0, plot=True):
         s, d, s_dot, d_dot, s_ddot, d_ddot, s_dddot, d_dddot = frenet
 
         # Metrics
-        gv = compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad)
+        gv = compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad, lane_hw, safe_dist)
         sm = compute_summary(st, d, x_cart, y_cart, obs_pos, obs_rad)
 
         # Execute: Frenet arrays → vehicle model → next FrenetState
-        state = execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot, vehicle)
+        state = execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot, vehicle, state.psi)
         hx.append(state.s); hy.append(state.d); hv.append(state.s_dot)
 
         # Record
@@ -105,6 +107,8 @@ def run(steps=150, seed=0, plot=True):
 
         print(report.print_cost())
         print(report.print_line())
+        if step % 5 == 0:
+            print_diag(diagnose(gen, result.x, ctx, safe_dist, state))
 
     if plot:
         np.savez(OUTPUT / "frenet_demo.npz",
@@ -112,7 +116,7 @@ def run(steps=150, seed=0, plot=True):
                  frames=np.array(frames, dtype=object))
         save_animation(fig, reports,
                        lambda i: render_frame(ax_t, ax_k, reports[i],
-                                              OBSTACLES, OBS_SAFE_DIST, gen.dt),
+                                              obs_list, safe_dist, gen.dt),
                        OUTPUT / "frenet_demo.gif")
 
 
