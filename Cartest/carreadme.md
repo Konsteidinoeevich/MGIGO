@@ -1,326 +1,186 @@
 # Cartest — Frenet B-Spline Trajectory MPC
 
-基于 Frenet 坐标系 + 五次 B 样条的 MPC 轨迹规划器。IGO 黑箱优化 + Constran 自相似 σ 嵌套约束。
+基于 Frenet 坐标系 + 五次 B 样条的 MPC 轨迹规划器。
+IGO 黑箱优化 + Constran 约束引擎。
 
-## 架构
+## 总体框架
 
 ```
-                          ┌─────────────────────┐
-                          │    ReferencePath     │  地图输入
-                          │  evaluate(s) → x,y,θ,κ │
-                          │  frenet→cartesian    │
-                          └──────────┬──────────┘
-                                     │
-  ┌──────────┐    ┌──────────┐       ▼
-  │  spline  │───▶│ frenet   │───▶ [s,d,ḃ,ḋ,s̈,d̈,s⃛,d⃛](t)  ← 规划
-  │  B,dB,   │    │ _traj    │    evaluate_plan() → st, (x,y)
-  │ d2B,d3B  │    └──────────┘         │
-  └──────────┘                         │
-                         ┌─────────────┼─────────────┐
-                         ▼             ▼             ▼
-                    ┌──────────┐  ┌──────────┐  ┌──────────┐
-                    │ warmstart│  │   cost   │  │constraints│
-                    │ Greville │  │ Σd²+Σv²  │  │P5→P1 嵌套│
-                    │build_mu()│  │build_ctx()│ │g_values()│
-                    └────┬─────┘  └────┬─────┘  └────┬─────┘
-                         │             │               │
-                         ▼             ▼               ▼
-                    ┌──────────────────────────────────────┐
-                    │         build_solver()               │
-                    │  Constran.build() + IGO 一站         │
-                    │  result = solver(key, ctx, mu_init)  │
-                    └────────────────┬─────────────────────┘
-                                     │
-                                     ▼  result.x → ctrl_s, ctrl_d
-  ┌──────────────┐    ┌──────────┐    ┌──────────────────────┐
-  │vehicle_model │◀───│ execute  │◀───│  s̈_cmd = plan(t=dt)  │  ← 执行
-  │摩擦圆 + Euler │    │FrenetState│   └──────────────────────┘
-  └──────────────┘    └──────────┘
-         │                  │
-         ▼                  ▼
+  ┌─────────────┐    ┌───────────┐
+  │ ReferencePath│    │  Scenario │   地图 & 场景
+  │  道路几何    │    │ 障碍物+参数│
+  └──────┬──────┘    └─────┬─────┘
+         │                 │
+         ▼                 ▼
+  ┌─────────────┐   ┌──────────────────────────┐
+  │ frenet_traj │   │ build_context + warmstart │  规划准备
+  │ evaluate +  │   │ + make_constraints        │
+  │ to_vehicle  │   └────────────┬─────────────┘
+  └──────┬──────┘                │
+         │                       ▼
+         │              ┌─────────────────┐
+         └──────────────│  build_solver() │  Constran + IGO 一站
+                        └────────┬────────┘
+                                 │
+                                 ▼  result.x → ctrl_s, ctrl_d
+  ┌──────────────┐    ┌──────────┐    ┌──────────────────┐
+  │ BicycleModel │◀───│ execute  │◀───│  s̈_cmd = plan    │  执行
+  │ 摩擦圆 + 转向│    │FrenetState│   │  (t=dt)           │
+  └──────────────┘    └──────────┘    └──────────────────┘
+         │
+         ▼
   ┌──────────┐    ┌──────────────────┐
   │ reporting│    │     plotting     │
   │StepReport│    │ setup/render/save│
   └──────────┘    └──────────────────┘
 ```
 
-### 核心思想：Frenet → 车辆运动学变换
-
-B 样条在 Frenet 坐标系 (s, d) 里规划。`to_vehicle_states()` 把 Frenet 导数变换到车辆坐标系：
-
-```
-v_t = (1-d·κ_r)·ḃ          切向速度（沿参考线）
-v_n = ḋ                    法向速度（跨参考线）
-v   = sqrt(v_t² + v_n²)   总速度
-
-a_t = (1-d·κ_r)·s̈ - 2·κ_r·ḃ·ḋ               切向加速度
-a_n = d̈ + κ_r·(1-d·κ_r)·ḃ²                   法向加速度（含离心项）
-
-a_long =  a_t·cosΔψ + a_n·sinΔψ              旋转到车辆纵轴
-a_lat  = -a_t·sinΔψ + a_n·cosΔψ              旋转到车辆横轴
-```
-
-弯曲参考线 (κ_r≠0) 下离心项可达 ACC_MAX 的 65%（R=100m, v=18m/s → κ_r·v²≈3.2 m/s²）。直路 (κ_r=0) 全部退化到简化形式。
-
-**cost 和约束都走 `to_vehicle_states()`，不再混用原始 Frenet 导数。**
+**分三层**：
+- **地图** (`ReferencePath`) — 道路中心线，提供 Frenet ↔ Cartesian 映射
+- **场景** (`Scenario`) — 障碍物、车道宽度、目标速度、初始状态，一个 dict 全包
+- **规划/执行** — B 样条轨迹优化 → IGO 求解 → 车辆模型仿真 → MPC 闭环
 
 ## 文件结构
 
 ```
 Cartest/
-├── spline.py            # B 样条基函数预计算 (B, dB, d2B, d3B, d4B)
-├── frenet_traj.py       # Frenet B 样条: evaluate, evaluate_plan, to_vehicle_states
-├── reference_path.py    # 参考线抽象 (Straight + 弯道接口)
+├── spline.py            # B 样条基函数预计算
+├── frenet_traj.py       # Frenet 轨迹: evaluate, evaluate_plan, to_vehicle_states
+├── reference_path.py    # 参考线 (StraightReference + 弯道接口)
+├── scenario.py          # 场景配置: 障碍物 + 道路参数 + 初始状态
 ├── warmstart.py         # Warm-start: build_initial_mu, mpc_warmstart
 ├── cost.py              # 目标函数 + build_context
-├── constraints.py       # 约束 + compute_g_values + compute_summary
-├── execute.py           # 执行: plan→model→FrenetState
-├── vehicle_model.py     # 车辆模型 (摩擦圆 + Euler)
+├── constraints.py       # 约束构建 + compute_g_values + compute_summary
+├── execute.py           # 执行桥: plan → model → FrenetState
+├── vehicle_model.py     # 车辆模型 (BicycleModel: 摩擦圆 + 转向 + yaw)
+├── diagnostics.py       # 诊断: raw obj, g 值, 车辆当前状态
 ├── reporting.py         # StepReport 记录
-├── plotting.py          # 可视化 (setup, render, save)
+├── plotting.py          # 可视化
 ├── Simple.py            # MPC demo
 └── bspline_basis.npz    # 预计算基函数矩阵
 ```
 
-## 1. 地图输入：ReferencePath
+## 1. 地图 — ReferencePath
 
-参考线 = 弧长参数化的光滑中心线。`ReferencePath` 是抽象基类，两个核心方法：
+参考线 = 弧长参数化的光滑中心线。实现 `evaluate(s) → (x, y, θ, κ)` 和 `frenet_to_cartesian(s, d)`。
 
-```python
-class ReferencePath:
-    def evaluate(self, s) -> (x_r, y_r, θ_r, κ_r)
-    def frenet_to_cartesian(self, s, d) -> (x, y)
-```
+内置 `StraightReference`（直路）。自定义弯道只需继承并实现 `evaluate`。
 
-### 内置：StraightReference
+规划在 (s, d) 空间进行，`to_vehicle_states()` 负责 Frenet → 车辆运动学变换（含离心项、Coriolis、Δψ 旋转）。
 
-```python
-from Cartest.reference_path import StraightReference
+## 2. 场景 — Scenario
 
-ref = StraightReference()
-# x = s, y = d, θ = 0, κ = 0
-```
-
-### 自定义弯道
-
-继承 `ReferencePath`，实现 `evaluate(s)`：
+`scenario.py` 是所有场景参数的唯一来源。切换场景只需改一行 import：
 
 ```python
-class CircularReference(ReferencePath):
-    def __init__(self, radius=100.0):
-        self.R = radius
-
-    def evaluate(self, s):
-        θ = s / self.R                          # 弧长 → 角度
-        x_r = self.R * jnp.sin(θ)               # 圆心在原点
-        y_r = self.R * (1 - jnp.cos(θ))
-        θ_r = θ                                  # 切线方向
-        κ_r = jnp.full_like(s, 1.0 / self.R)    # 恒定曲率
-        return x_r, y_r, θ_r, κ_r
+from Cartest.scenario import THREE_BLOCKING as scenario
 ```
 
-参考线只用于**避障约束**的 Frenet→Cartesian 映射和车辆状态的 heading/曲率计算。规划本身完全在 (s, d) 空间进行。
-
-## 2. B 样条轨迹
-
-5 次 (quintic) B 样条，12 个控制点，10 秒规划时域，C⁴ 连续。
-
-```
-t_eval ∈ [0, 10]s, dt = 0.1s, T = 100 个采样点
-```
-
-### 夹紧边界条件（C0/C1/C2）
-
-前 3 个控制点夹紧，保证从当前状态出发：
-
-```
-P0 = x0                                    → C0: 位置连续
-P1 = P0 + (Δt_knot/5) · v0                → C1: 速度连续
-P2 = 3·P1 − 2·P0 + (Δt²_knot/10) · a0   → C2: 加速度连续
-```
-
-后 9 个控制点是自由的（优化变量），θ = [ctrl_s(9) | ctrl_d(9)]，共 18 维。
-
-### 基函数矩阵
-
-预计算 `spline.py` 生成 `bspline_basis.npz`：
-
-```bash
-uv run python Cartest/spline.py
-```
-
-生成 B, dB, d2B, d3B, d4B 矩阵（各 [100, 12]）和 Greville 横坐标。
-
-## 3. 车辆模型 & 执行
-
-执行链：`execute_step()` 取 plan 的期望加速度 → 车辆模型前向仿真 → 返回 `FrenetState`。
+每个场景是一个 dict：
 
 ```python
-from Cartest.execute import execute_step, FrenetState
-
-# execute_step 内部:
-#   1. s_ddot_cmd = plan(t=dt)      ← plan 的意图
-#   2. vehicle.step(cmd)            ← 摩擦圆 + Euler
-#   3. return FrenetState(s, s_dot, s_ddot=ax, ...)  ← 模型的真实加速度
+SCENE = {
+    "obstacles": [
+        {"x": 45.0, "y": -2.5, "r": 2.0},   # 障碍物列表
+        {"x": 65.0, "y":  0.5, "r": 2.0},
+    ],
+    "lane_hw":       2.0,      # 半车道宽度 (m)
+    "obs_safe_dist": 0.1,      # RSS 反应时间 (s)
+    "v_target":     18.0,      # 目标速度 (m/s)
+    "init": {                  # 初始车辆状态
+        "s": 0.0, "s_dot": 12.0, "s_ddot": 0.0,
+        "d": -3.0, "d_dot":  0.0, "d_ddot": 0.0,
+        "psi": 0.0,
+    },
+}
 ```
+
+所有模块从场景取值，无重复定义。
+
+## 3. 初始状态 — FrenetState
+
+`execute.py` 定义了 `FrenetState` 数据类，包含完整车辆状态和 `to_ctx()` 方法：
 
 ```python
-# vehicle_model.py
-class FrenetVehicleModel:
-    def __init__(self, mu=0.85, dt=0.1):
-        self.a_max = mu * 9.81    # ≈ 8.3 m/s² 摩擦圆
-
-    def step(self, s0, d0, s_dot0, d_dot0, s_ddot_cmd, d_ddot_cmd):
-        a_cmd = sqrt(s_ddot_cmd² + d_ddot_cmd²)
-        scale = min(1.0, a_max / a_cmd)
-        ax, ay = s_ddot_cmd * scale, d_ddot_cmd * scale
-        # Euler 积分
-        return s0 + s_dot0*dt, d0 + d_dot0*dt, \
-               s_dot0 + ax*dt, d_dot0 + ay*dt, ax, ay
+@dataclass
+class FrenetState:
+    s:      float   # 纵向位置 (m)
+    s_dot:  float   # 纵向速度 (m/s)
+    s_ddot: float   # 纵向加速度 (m/s²)
+    d:      float   # 横向偏移 (m)
+    d_dot:  float   # 横向速度 (m/s)
+    d_ddot: float   # 横向加速度 (m/s²)
+    psi:    float   # 航向角 (rad)
 ```
 
-**换模型只需改 `vehicle_model.py`**——`execute_step` 只依赖 `step()` 接口。
+场景中的 `init` 直接构造 `FrenetState`，经 `build_context()` 生成 solver 的 `ctx`。
 
-## 4. 代价函数 & 约束
+## 4. B 样条轨迹
 
-### 目标
+5 次 B 样条，12 控制点（前 3 夹紧 = C0/C1/C2 初始状态匹配），10 秒时域，100 采样点。后 9 控制点自由（18 维优化变量）。
+
+`evaluate_plan()` 一站返回 Frenet + 车辆状态 [T,9] + Cartesian 坐标。
+
+## 5. 车辆模型 & 执行
+
+`BicycleModel`（转向 + 摩擦圆 + yaw 动力学）：
+
+```
+plan 输出 s̈_cmd, d̈_cmd
+  → 旋转到车体 (a_long, a_lat)
+  → 转向角 δ = arctan(a_lat·L/v²)
+  → 摩擦圆限幅
+  → ψ̇ = v·tan(δ)/L
+  → Frenet 积分
+  → 返回 FrenetState (含 ψ)
+```
+
+`execute_step()` 是纯桥接——取 plan 的指令，传模型仿真，透传结果。换模型只改 `vehicle_model.py`。
+
+## 6. IGO 优化器
+
+`build_solver()` 一站：Constran 约束组装 + solver 选择 + 参数初始化 + best-x 提取。
 
 ```python
-# cost.py — 也走 to_vehicle_states
-d, v = _eval_all(theta, ctx, gen)   # d: Frenet 横向偏移, v: st[:,2] 总速度
-cost = Σ(v - v_target)² + Σ(d)²
-```
-
-两个目标：进入车道中心 (d→0)，达到目标速度 (v→v_target)。B 样条自带 C⁴ 光滑，无需显式平滑惩罚。
-
-### 约束：按积分链组织
-
-物理量的因果积分链：
-
-```
-jerk (s⃛) ──∫──▶ acc (s̈) ──∫──▶ speed (ḃ) ──∫──▶ position (s,d)
- 控制输入         中间量         中间量           输出
- 最外层           ...            ...            最内层
- P5               P4             P3             P2, P1
-```
-
-约束按积分链从外到内排列（Constran self-similar σ 嵌套）：
-
-| Priority | 层 | 约束 | 来源 |
-|----------|----|------|------|
-| P1 (内) | 避障 | 穿透深度 | `to_vehicle_states → x,y` |
-| P2 | 车道 | `|d| ≤ lane_hw` | Frenet d |
-| P3 | 速度 | `V_min ≤ v ≤ V_max` | `st[:,2]` (车辆总速度) |
-| P4 | 加速度 | `max(|a_long|,|a_lat|,|a_total|) ≤ ACC_MAX` | `st[:,4:6]` |
-| P5 (外) | jerk | `max(|j_long|,|j_lat|,|j_total|) ≤ JERK_MAX` | `st[:,6:8]` |
-
-### 为什么这个顺序？
-
-- 积分链因果：jerk → acc → speed → position → 避障距离。外层物理约束对了，内层避障才可执行。
-
-### 模式
-
-- **P1 (obstacle)**: `mode='hard'` → baseline=2.0 → 安全底线
-- **P2-P5**: `mode='soft'` → baseline=0 → 无违规时透明 → 目标信号恢复
-
-### 约束函数 — 统一走 to_vehicle_states
-
-```python
-def acc_g(theta, ctx):
-    st = _eval_vehicle_states(theta, ctx, gen)   # [T, 9] 车辆状态
-    a_long, a_lat = st[:, 4], st[:, 5]
-    am = jnp.sqrt(a_long**2 + a_lat**2)
-    # 三者取最大: 纵向 / 横向 / 合成幅值
-    return jnp.maximum(
-        jnp.maximum(0., jnp.abs(a_long) - ACC_MAX),
-        jnp.maximum(jnp.maximum(0., jnp.abs(a_lat) - ACC_MAX),
-                    jnp.maximum(0., am - ACC_MAX)),
-    )
-
-def jerk_g(theta, ctx):   # 同理, 用 st[:,6:8]
-    ...
-```
-
-## 5. IGO 优化器
-
-`build_solver()` 把 Constran 构建 + solver 选择 + 参数初始化 + best-x 提取全包了：
-
-```python
-from gmm_igo.solver_builder import build_solver
-
-solver = build_solver(
-    obj_fn, dims=(9, 9),
-    constraints=constraints,      # Constran.build() 内部处理
-    solver='m22',                 # 自动选: 'auto' / 'm22' / 'reuse_multi'
-    T=500, dt=0.15, K=3, B=64, B0=20, T_0=250,
-    k_inner=0.1, obj_transform='standard',
+solver = build_solver(obj_fn, dims=(9, 9),
+    constraints=make_constraints(gen, lane_hw, safe_dist),
+    solver='m22', T=300, dt=0.15, K=3, B=100, B0=45, T_0=300,
+    k_inner=1.0, obj_transform='standard',
 )
 
-# MPC 循环中一行求解:
 result = solver(key, context=ctx, initial_mu=mu_init)
 ctrl_s, ctrl_d = result.x[:9], result.x[9:]
-# result.cost, result.mu, result.S_or_L, result.pi 全可用
-
-# 也可继承上一轮 GMM 状态:
-result = solver(key, context=ctx, warm_start=prev_result)
 ```
 
-IGO 是黑箱全局优化——不需要梯度，只要求值。
+支持 GMM 状态继承：`solver(key, context=ctx, warm_start=prev_result)`。
 
-### MPC 主循环
-
-```python
-state = FrenetState(s=0, s_dot=12, s_ddot=0, d=-3, d_dot=0, d_ddot=0)
-
-for step in range(steps):
-    ctx      = build_context(gen, state, V_TARGET, LANE_HW, obs_pos, obs_rad)
-    mu_init  = build_initial_mu(gen, state.s, state.s_dot, state.d)
-    result   = solver(key, context=ctx, initial_mu=mu_init)
-    frenet, st, (x, y) = gen.evaluate_plan(result.x[:9], result.x[9:], ctx)
-    gv       = compute_g_values(st, d, x, y, obs_pos, obs_rad)
-    sm       = compute_summary(st, d, x, y, obs_pos, obs_rad)
-    state    = execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot, vehicle)
-    report   = StepReport(...)
-```
-
-## 6. 运行
+## 7. 运行
 
 ```bash
-# 1. 生成基函数矩阵 (只需一次)
-uv run python Cartest/spline.py
-
-# 2. 运行 MPC demo
+uv run python Cartest/spline.py     # 生成基函数矩阵 (只需一次)
 uv run python Cartest/Simple.py --steps 150 --seed 0
-
-# 跳过绘图
 uv run python Cartest/Simple.py --steps 50 --no-plot
 ```
 
-输出 `Cartest/frenet_demo.gif`（执行轨迹 vs 规划轨迹的动画）。
+输出 `Cartest/frenet_demo.gif`。
 
-## 7. 关键设计决策
+## 8. 关键设计决策
 
 | 决策 | 理由 |
 |------|------|
-| Frenet 坐标 | ctrl→jerk/acc 线性，消除 Cartesian 的非线性放大 |
-| `to_vehicle_states` 统一 | cost/约束/reporting 同一口径，离心/Coriolis/(1-d·κ_r) 全包含 |
-| 5 次 B 样条 | C⁴ 连续：jerk 连续，bang 有界 |
-| 单侧夹紧 | 初始状态精确匹配；终端自由（MPC 只执行第一步） |
-| `evaluate_plan()` 一站评估 | Frenet + 车辆状态 + Cartesian 一次调用，避免重复 |
-| Greville-based warm-start | 精确常速轨迹：jerk=0, acc=0 |
-| `build_initial_mu()` | 物理 warm-start → solver-ready mu_init，一行调用 |
-| soft constraints (P2-P5) | 无违规时透明，目标信号不被 baseline 淹没 |
-| hard constraint (P1) | 安全底线，baseline=2.0 不可协商 |
-| 约束三取一罚函数 | `max(|long|-LIM, |lat|-LIM, |total|-LIM, 0)` 方向+幅值全覆盖 |
-| `compute_g_values/summary` | 约束公式同源，reporting 不会跟约束不同步 |
-| `build_context()` | ctx 构造统一入口，不再手写字典 |
-| `FrenetState` dataclass | 类型安全，`.to_ctx()` 直接生成 ctx 条目 |
-| `build_solver()` | Constran + solver + best-x 一站，warm_start 继承 GMM |
-| execute → model → 真实状态 | 规划/仿真解耦，摩擦圆限幅后的真实加速度写回 state |
+| Frenet 坐标 | 参考线承担曲率，B 样条 ctrl→物理量线性 |
+| `to_vehicle_states` 统一 | cost/约束/reporting 同口径 |
+| Scenario 单文件 | 切场景只改一行 import |
+| `FrenetState` dataclass | 类型安全，`.to_ctx()` 自动 |
+| `BicycleModel` | 转向 + yaw + 摩擦圆，比点质量真 |
+| `build_solver()` | Constran + IGO + warm-start 一站 |
+| 自相似 σ 嵌套约束 | 外→内: jerk/acc/speed/lane/obs，因果积分链对齐 |
+| RSS 障碍物约束 | 纵向制动距离 + 横向间隙，各自判定取 max |
+| 诊断分离 | `cur_obs`=车辆真实距离, `g_max`=规划层约束压力 |
 
 ## 依赖
 
-- `jax[cuda12]` — B 样条矩阵运算
+- `jax[cuda12]` — 矩阵运算
 - `numpy`, `scipy` — 基函数预计算
 - `matplotlib` — 可视化
 - `gmm_igo` — IGO 优化器
