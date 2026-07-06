@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 DEGREE = 5                # Quintic B-spline (C⁴ continuous)
-N_CTRL = 12               # 12 control points → 7 internal knot segments
+N_CTRL = 10               # 10 control points → 5 internal knot segments
 T = 100                   # Evaluation time steps
 DT = 0.1                  # Time step (seconds)
 TOTAL_TIME = T * DT       # 10.0 second horizon

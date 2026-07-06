@@ -31,11 +31,15 @@ def diagnose(gen, theta, ctx, obs_safe_dist: float = 0.5, state=None):
     j_long, j_lat = st[:, 6], st[:, 7]
     x_cart, y_cart = gen.to_cartesian(s, d)
 
-    # ── Raw objective (matches cost.py: s_dot, not v) ──
-    raw_speed = float((s_dot[-1] - ctx["v_ref"][-1]) ** 2)
-    raw_lat   = float(jnp.sum(d ** 2))
-    raw_ddot  = float(jnp.sum(d_dot ** 2))
-    raw_obj   = raw_speed + raw_lat + 0.1 * raw_ddot
+    # ── Raw objective (matches cost.py: error-dynamics poly) ──
+    w_s, w_d = 1.0, 1.0
+    ev = s_dot - ctx["v_ref"]
+    poly_s = s_ddot + 2.0 * w_s * ev
+    raw_spd = float(jnp.sum(poly_s ** 2) + 0.2 * w_s ** 2 * jnp.sum(ev ** 2))
+    poly_d = (s_dddot + 3.0 * w_d * s_ddot
+              + 3.0 * w_d ** 2 * d_dot + w_d ** 3 * d)
+    raw_lat = float(jnp.sum(poly_d ** 2) + 0.3 * w_d ** 4 * jnp.sum(d_dot ** 2))
+    raw_obj = raw_spd + raw_lat
 
     # ── Raw g values (before T_alpha) ──
     am = jnp.sqrt(a_long ** 2 + a_lat ** 2)
@@ -51,25 +55,28 @@ def diagnose(gen, theta, ctx, obs_safe_dist: float = 0.5, state=None):
                     jnp.maximum(jnp.maximum(0., jnp.abs(j_lat) - 5.0),
                                 jnp.maximum(0., jm - 5.0)))))
     g_lane_max = float(jnp.max(jnp.maximum(0., jnp.abs(d) - ctx["lane_hw"])))
-    rho = obs_safe_dist
-    d_rss = v * rho + v ** 2 / (2.0 * 8.0)
-    dx = x_cart[:, None] - ctx["obs_pos"][None, :, 0]
-    dy = y_cart[:, None] - ctx["obs_pos"][None, :, 1]
-    r  = ctx["obs_rad"][None, :]
-    pen_x = jnp.maximum(0., d_rss[:, None] + r - jnp.abs(dx))
-    pen_y = jnp.maximum(0., r - jnp.abs(dy))
-    g_obs_max = float(jnp.max(jnp.maximum(pen_x, pen_y)))
+    if ctx["obs_pos"].shape[0] == 0:
+        g_obs_max = 0.0
+    else:
+        rho = obs_safe_dist
+        d_rss = v * rho + v ** 2 / (2.0 * 8.0)
+        dx = x_cart[:, None] - ctx["obs_pos"][None, :, 0]
+        dy = y_cart[:, None] - ctx["obs_pos"][None, :, 1]
+        r  = ctx["obs_rad"][None, :]
+        pen_x = jnp.maximum(0., d_rss[:, None] + r - jnp.abs(dx))
+        pen_y = jnp.maximum(0., r - jnp.abs(dy))
+        g_obs_max = float(jnp.max(jnp.maximum(pen_x, pen_y)))
 
     # Vehicle's current distance to nearest obstacle
     cur_dist = None
-    if state is not None:
+    if state is not None and ctx["obs_pos"].shape[0] > 0:
         cur_dx = state.s - ctx["obs_pos"][:, 0]
         cur_dy = state.d - ctx["obs_pos"][:, 1]
         cur_dist = float(jnp.min(jnp.sqrt(cur_dx ** 2 + cur_dy ** 2) - ctx["obs_rad"]))
 
     return {
         'raw_obj': raw_obj,
-        'raw_speed': raw_speed, 'raw_lat': raw_lat, 'raw_ddot': raw_ddot,
+        'raw_spd': raw_spd, 'raw_lat': raw_lat,
         's_dot_mean': float(jnp.mean(s_dot)), 's_dot_min': float(jnp.min(s_dot)), 's_dot_max': float(jnp.max(s_dot)),
         'd_rms': float(jnp.sqrt(jnp.mean(d ** 2))),
         'd_min': float(jnp.min(d)), 'd_max': float(jnp.max(d)),
@@ -84,7 +91,7 @@ def diagnose(gen, theta, ctx, obs_safe_dist: float = 0.5, state=None):
 
 def print_diag(d):
     print(f"  DIAG: raw_obj={d['raw_obj']:.0f} "
-          f"speed={d['raw_speed']:.0f} lat={d['raw_lat']:.0f} ddot={d['raw_ddot']:.0f}")
+          f"spd={d['raw_spd']:.0f} lat={d['raw_lat']:.0f}")
     print(f"        s_dot_mean={d['s_dot_mean']:.1f} s_dot=[{d['s_dot_min']:.1f},{d['s_dot_max']:.1f}]  "
           f"d_rms={d['d_rms']:.2f} d_range=[{d['d_min']:.1f},{d['d_max']:.1f}]")
     if d['cur_obs'] is not None:

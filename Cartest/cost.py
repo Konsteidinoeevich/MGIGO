@@ -39,49 +39,75 @@ def build_context(gen, state, v_ref, lane_hw, obs_pos, obs_rad):
 # ═══════════════════════════════════════════════════════════════════════
 
 def _eval_all(theta, ctx, gen):
-    """Unpack theta → Frenet trajectory.
-
-    Returns (d, d_dot, s_dot, s_ddot) — lateral position/velocity, longitudinal velocity/accel.
-    """
+    """Unpack theta → Frenet trajectory (up to jerk, all quantities)."""
     n = gen.n_free
     ctrl_s_free = theta[:n]
     ctrl_d_free = theta[n:2 * n]
 
-    s, d, s_dot, d_dot, s_ddot, d_ddot, _, _ = gen.evaluate(
+    s, d, s_dot, d_dot, s_ddot, d_ddot, s_dddot, d_dddot = gen.evaluate(
         ctrl_s_free, ctrl_d_free,
         ctx["s0"], ctx["s_dot0"], ctx["s_ddot0"],
         ctx["d0"], ctx["d_dot0"], ctx["d_ddot0"],
     )
-    return d, d_dot, s_dot, s_ddot
+    return s, d, d_dot, d_ddot, d_dddot, s_dot, s_ddot, s_dddot
 
 
-def make_objective(gen):
-    """Build objective aligned with integrator chains.
+def make_objective(gen, omega_s: float = 1.0, omega_d: float = 1.0,
+                   alpha: float = 0.5):
+    """Coupled s/d Lyapunov cost — both channels track position errors.
 
-    d-channel (3-integrator):  d⃛ → d̈ → d_dot → d
-      virtual control:  d_dot* = -k₁·d
-      cost:              Σ (d_dot + k₁·d)²        — damps automatically
+    e = [es, ed]  with  es = s−s_ref,  ed = d
 
-    s-channel (3-integrator):  s⃛ → s̈ → s_dot → s
-      virtual control:  s̈* = -k₂·(s_dot − v_target)
-      cost:              Σ (s_dot − v_target)² + Σ (s̈ + k₂·(s_dot − v_target))²
-                         — accel steers speed toward target, not against it
+    s_ref_dot(t) = v_tgt + (v0 − v_tgt)·e^(−ω_s·t)
+    s_ref(t)     = s0 + v_tgt·t + (v0−v_tgt)/ω_s · (1−e^(−ω_s·t))
+
+    α² < ω_s·ω_d  ensures K ≻ 0.
     """
 
-    k_lat = 0.5   # lateral-convergence rate (≈ bandwidth of d_channel)
-    k_spd = 0.5   # speed-tracking rate  (≈ bandwidth of s_channel)
+    t_arr = jnp.arange(gen.T) * gen.dt  # [T]
 
     def obj_fn(theta, ctx):
-        d, d_dot, s_dot, s_ddot = _eval_all(theta, ctx, gen)
+        s, d, d_dot, d_ddot, d_dddot, s_dot, s_ddot, s_dddot = _eval_all(theta, ctx, gen)
 
-        # d-channel: penalise departure from d_dot* = -k_lat·d
-        lat_cost = jnp.sum((d_dot + k_lat * d) ** 2)
+        v_tgt = ctx["v_ref"][0]
+        s0    = ctx["s0"]
+        v0    = ctx["s_dot0"]
+        dv    = v0 - v_tgt                              # speed gap (negative if accelerating)
+        lam   = omega_s
+        exp_term = jnp.exp(-lam * t_arr)                 # [T]
+        s_ref      = s0 + v_tgt * t_arr + dv / lam * (1.0 - exp_term)
+        s_ref_dot  = v_tgt + dv * exp_term
+        s_ref_ddot = -dv * lam * exp_term
 
-        # s-channel: speed tracking + accel steering
-        speed_err = s_dot - ctx["v_ref"]
-        spd_cost = jnp.sum(speed_err ** 2)
-        acc_cost = jnp.sum((s_ddot + k_spd * speed_err) ** 2)
+        # position errors (both channels symmetric now)
+        es = s - s_ref
+        ed = d
 
-        return lat_cost + spd_cost + 0.1 * acc_cost
+        es_dot = s_dot   - s_ref_dot
+        ed_dot = d_dot
+
+        es_ddot = s_ddot  - s_ref_ddot
+        ed_ddot = d_ddot
+
+        # K matrix and coupling (same as before)
+        K00, K01 = omega_s, alpha
+        K10, K11 = alpha,   omega_d
+
+        K2_00 = K00**2 + K01*K10
+        K2_01 = K00*K01 + K01*K11
+        K2_10 = K10*K00 + K11*K10
+        K2_11 = K10*K01 + K11**2
+
+        term0 = es**2 + ed**2
+
+        v1_s = es_dot + K00*es + K01*ed
+        v1_d = ed_dot + K10*es + K11*ed
+        term1 = v1_s**2 + v1_d**2
+
+        v2_s = es_ddot + 2.0*(K00*es_dot + K01*ed_dot) + K2_00*es + K2_01*ed
+        v2_d = ed_ddot + 2.0*(K10*es_dot + K11*ed_dot) + K2_10*es + K2_11*ed
+        term2 = v2_s**2 + v2_d**2
+
+        return jnp.sum(term0) + jnp.sum(term1) + jnp.sum(term2)
 
     return obj_fn

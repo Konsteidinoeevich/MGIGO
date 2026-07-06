@@ -386,7 +386,7 @@ def _assemble_nest(objective_fn: Callable,
 
     M = np.sqrt(2.0)
     n_constraints = len(layers)
-    n_total = n_constraints + 1  # +1: final σ·m wrap to bound output
+    n_total = n_constraints + 1  # n constraints + obj's own σ wrap
 
     def cost_fn(x, ctx):
         inner = obj_T_fn(objective_fn(x, ctx))

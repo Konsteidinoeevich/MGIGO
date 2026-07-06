@@ -15,13 +15,12 @@ from Cartest.frenet_traj import FrenetBSplineTrajectory
 from Cartest.reference_path import StraightReference
 from Cartest.warmstart import build_initial_mu
 from Cartest.cost import make_objective, build_context
-from Cartest.execute import execute_step
+from Cartest.execute import execute_perfect_tracking
 from Cartest.constraints import make_constraints, compute_g_values, compute_summary
-from Cartest.vehicle_model import BicycleModel
 from Cartest.reporting import StepReport
 from Cartest.plotting import setup_axes, render_frame, save_animation
 from Cartest.diagnostics import diagnose, print_diag
-from Cartest.scenario import THREE_BLOCKING as scenario
+from Cartest.scenario import EMPTY as scenario
 from gmm_igo.solver_builder import build_solver
 
 
@@ -46,13 +45,12 @@ def run(steps=150, seed=0, plot=True):
     obs_rad = jnp.array([o["r"] for o in obs_list], dtype=jnp.float32)
 
     solver = build_solver(
-        make_objective(gen), dims=(gen.n_free, gen.n_free),
+        make_objective(gen, omega_s=1.0, omega_d=4.0, alpha=0.0), dims=(gen.n_free, gen.n_free),
         constraints=make_constraints(gen, lane_hw, safe_dist),
-        solver='m22', T=300, dt=0.15, K=3, B=100, B0=45, T_0=300,
+        solver='m22', T=300, dt=0.3, K=3, B=64, B0=30, T_0=300,
         k_inner=1.0, obj_transform='standard',
     )
 
-    vehicle = BicycleModel(mu=0.85, dt=gen.dt)
     key = random.PRNGKey(seed)
 
     from Cartest.execute import FrenetState
@@ -87,8 +85,8 @@ def run(steps=150, seed=0, plot=True):
         gv = compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad, lane_hw, safe_dist)
         sm = compute_summary(st, d, x_cart, y_cart, obs_pos, obs_rad)
 
-        # Execute: Frenet arrays → vehicle model → next FrenetState
-        state = execute_step(gen, s, d, s_dot, d_dot, s_ddot, d_ddot, vehicle, state.psi)
+        # Execute: use plan's predicted next state (perfect tracking)
+        state = execute_perfect_tracking(s, d, s_dot, d_dot, s_ddot, d_ddot, st[1, 3])
         hx.append(state.s); hy.append(state.d); hv.append(state.s_dot)
 
         # Record

@@ -22,7 +22,7 @@ from Constraintdealer.Constran import Deterministic
 # Physical limits (hardware — not scenario-specific)
 V_MIN, V_MAX = 2.0, 35.0
 ACC_MAX = 5.0          # m/s²
-JERK_MAX = 5.0         # m/s³
+JERK_MAX = 2.0         # m/s³  (tight: comfort limit)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -66,13 +66,11 @@ def make_constraints(gen, lane_hw: float, obs_safe_dist: float):
     """
 
     def obs_g(theta, ctx):
-        """RSS: longitudinal braking + lateral clearance, per obstacle.
+        """RSS: longitudinal + lateral safe distance per obstacle."""
+        n_obs = ctx["obs_pos"].shape[0]
+        if n_obs == 0:
+            return jnp.zeros(gen.T)  # no obstacles → no violation
 
-        Longitudinal:  if approaching an obstacle (dx decreasing),
-                       must have enough distance to brake: |dx| ≥ d_RSS(v).
-        Lateral:       |dy| ≥ r_obs  at the closest approach.
-        Take the max of both, max over obstacles.
-        """
         st = _eval_vehicle_states(theta, ctx, gen)
         x, y, v = st[:, 0], st[:, 1], st[:, 2]
         rho = obs_safe_dist
@@ -178,28 +176,31 @@ def compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad,
 
     g_lane = jnp.quantile(jnp.maximum(0., jnp.abs(d) - lane_hw), 0.9)
 
-    rho = obs_safe_dist
-    d_rss = v * rho + v ** 2 / (2.0 * 8.0)
-    dx = x_cart[:, None] - obs_pos[None, :, 0]
-    dy = y_cart[:, None] - obs_pos[None, :, 1]
-    r  = obs_rad[None, :]
-    pen_x = jnp.maximum(0., d_rss[:, None] + r - jnp.abs(dx))
-    pen_y = jnp.maximum(0., r - jnp.abs(dy))
-    g_obs = float(jnp.max(jnp.maximum(pen_x, pen_y)))
+    if obs_pos.shape[0] == 0:
+        g_obs = 0.0
+    else:
+        rho = obs_safe_dist
+        d_rss = v * rho + v ** 2 / (2.0 * 8.0)
+        dx = x_cart[:, None] - obs_pos[None, :, 0]
+        dy = y_cart[:, None] - obs_pos[None, :, 1]
+        r  = obs_rad[None, :]
+        pen_x = jnp.maximum(0., d_rss[:, None] + r - jnp.abs(dx))
+        pen_y = jnp.maximum(0., r - jnp.abs(dy))
+        g_obs = float(jnp.max(jnp.maximum(pen_x, pen_y)))
 
-    g_jerk = jnp.quantile(
+    g_jerk = float(jnp.max(
         jnp.maximum(
             jnp.maximum(0., jnp.abs(j_long) - JERK_MAX),
             jnp.maximum(jnp.maximum(0., jnp.abs(j_lat) - JERK_MAX),
                         jnp.maximum(0., jm - JERK_MAX)),
-        ), 0.9)
+        )))  # max — matches constraint aggregate
 
-    g_acc = jnp.quantile(
+    g_acc = float(jnp.max(
         jnp.maximum(
             jnp.maximum(0., jnp.abs(a_long) - ACC_MAX),
             jnp.maximum(jnp.maximum(0., jnp.abs(a_lat) - ACC_MAX),
                         jnp.maximum(0., am - ACC_MAX)),
-        ), 0.9)
+        )))  # max — matches constraint aggregate
 
     g_spd = jnp.quantile(
         jnp.maximum(jnp.maximum(0., V_MIN - v), jnp.maximum(0., v - V_MAX)), 0.9)
@@ -216,11 +217,13 @@ def compute_summary(st, d, x_cart, y_cart, obs_pos, obs_rad):
     j_long, j_lat = st[:, 6], st[:, 7]
     jm = jnp.sqrt(j_long ** 2 + j_lat ** 2)
 
-    dist = jnp.sqrt((x_cart[:, None] - obs_pos[None, :, 0]) ** 2 +
-                    (y_cart[:, None] - obs_pos[None, :, 1]) ** 2) - obs_rad[None, :]
-
+    if obs_pos.shape[0] == 0:
+        min_obs = 1e9
+    else:
+        dist = jnp.sqrt((x_cart[:, None] - obs_pos[None, :, 0]) ** 2 +
+                        (y_cart[:, None] - obs_pos[None, :, 1]) ** 2) - obs_rad[None, :]
     return {
-        'min_obs': float(jnp.min(dist)),
+        'min_obs': min_obs,
         'max_a_long': float(jnp.max(jnp.abs(a_long))),
         'max_a_lat':  float(jnp.max(jnp.abs(a_lat))),
         'max_jerk':   float(jnp.max(jm)),

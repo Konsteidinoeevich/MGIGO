@@ -36,6 +36,15 @@ class ReferencePath:
         y = y_r + d * jnp.cos(θ_r)
         return x, y
 
+    def cartesian_to_frenet(self, x: jnp.ndarray, y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Convert Cartesian (x, y) to Frenet (s, d). Inverse of frenet_to_cartesian.
+
+        For general paths this requires solving the foot-of-perpendicular
+        condition via 1D Newton.  The base class raises NotImplementedError;
+        subclasses (including StraightReference) provide the implementation.
+        """
+        raise NotImplementedError
+
 
 class StraightReference(ReferencePath):
     """Straight road aligned with x-axis: x=s, y=0, θ=0, κ=0."""
@@ -50,3 +59,7 @@ class StraightReference(ReferencePath):
     def frenet_to_cartesian(self, s: jnp.ndarray, d: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         # Straight road: x = s, y = d (no sin/cos needed)
         return s, d
+
+    def cartesian_to_frenet(self, x: jnp.ndarray, y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        # Straight road: s = x, d = y
+        return x, y

@@ -421,7 +421,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run MPC simulation and export video.")
     parser.add_argument(
         "--video",
-        default=os.path.join("outcmaes", "mpcmain21.gif"),
+        default=os.path.join("outcmaes", "mpcmain21new.gif"),
         help="gif"
     )
     parser.add_argument(

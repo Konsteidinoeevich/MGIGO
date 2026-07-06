@@ -24,12 +24,12 @@ import jax.numpy as jnp
 # ═══════════════════════════════════════════════════════════════════════
 
 def tangent_warmstart(gen, s0: float, v_target: float, d0: float = 0.0):
-    """Constant-speed free control points (P3..P11) using Greville abscissae.
+    """Constant-speed free control points (P2..P11) using Greville abscissae.
 
-    Clamped P0,P1,P2 + these free points → exact constant speed *v_target*,
-    exact zero acceleration, exact zero jerk.
+    Clamped P0,P1 (C0/C1) + these free points → exact constant speed,
+    with free initial acceleration set by B-spline/optimizer.
     """
-    ctrl_s = s0 + v_target * gen.greville[3:]
+    ctrl_s = s0 + v_target * gen.greville[2:gen.n_ctrl]
     ctrl_d = jnp.full((gen.n_free,), d0, dtype=jnp.float32)
     return ctrl_s, ctrl_d
 

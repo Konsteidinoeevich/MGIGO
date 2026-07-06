@@ -297,19 +297,25 @@ def build_solver(
             jnp.meshgrid(*[jnp.arange(K_) for _ in range(M)], indexing='ij'),
             axis=-1,
         ).reshape(-1, M)
-        def build_x(indices):
-            parts = [mu[j, indices[j], :dims[j]] for j in range(M)]
-            return jnp.concatenate(parts)
-        all_x = jax.vmap(build_x)(idx_grid)
-        costs = jax.vmap(lambda x: cost_fn(x, context))(all_x)
-        best_i = jnp.argmin(costs)
-        return all_x[best_i], costs[best_i]
+        # Evaluate one‑by‑one to avoid vmap / jitted cost_fn dispatch mismatch
+        best_x = None; best_c = jnp.inf
+        for i in range(idx_grid.shape[0]):
+            parts = [mu[j, idx_grid[i, j], :dims[j]] for j in range(M)]
+            x_i = jnp.concatenate(parts)
+            c_i = cost_fn(x_i, context)
+            if c_i < best_c:
+                best_c = c_i; best_x = x_i
+        return best_x, best_c
 
     def _best_x_from_single_block(mu, cost_fn, context, dims):
         mu_eff = mu[0, :, :dims[0]]
-        costs = jax.vmap(lambda m: cost_fn(m, context))(mu_eff)
-        best_i = jnp.argmin(costs)
-        return mu_eff[best_i], costs[best_i]
+        # Evaluate one‑by‑one to avoid vmap / jitted cost_fn dispatch mismatch
+        best_i = 0; best_c = jnp.inf
+        for i in range(mu_eff.shape[0]):
+            c_i = cost_fn(mu_eff[i], context)
+            if c_i < best_c:
+                best_c = c_i; best_i = i
+        return mu_eff[best_i], best_c
 
     def _best_x(mu, cost_fn, context, M, dims):
         if M == 1:
