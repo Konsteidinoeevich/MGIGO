@@ -16,13 +16,13 @@ import jax.numpy as jnp
 import numpy as np
 from numpy.testing import assert_allclose
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from Cartest.frenet_traj import FrenetBSplineTrajectory, make_frenet_reference
-from Cartest.reference_path import StraightReference, ReferencePath
-from Cartest.execute import execute_perfect_tracking, FrenetState
+from Cartest.core.frenet_traj import FrenetBSplineTrajectory, make_frenet_reference
+from Cartest.core.reference_path import StraightReference, ReferencePath
+from Cartest.execution.execute import execute_perfect_tracking, FrenetState
 
-OUTPUT = Path(__file__).resolve().parent
+BASIS = Path(__file__).resolve().parents[1] / "basis"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -76,7 +76,7 @@ class CircularReference(ReferencePath):
 def _make_gen():
     """Create a FrenetBSplineTrajectory with StraightReference."""
     ref_path = StraightReference()
-    return FrenetBSplineTrajectory(OUTPUT / "bspline_basis.npz", ref_path)
+    return FrenetBSplineTrajectory(BASIS / "bspline_basis.npz", ref_path)
 
 
 def test_from_vehicle_states_round_trip():
@@ -238,7 +238,7 @@ def test_no_jerk_input():
 def _make_circular_gen(radius=100.0):
     """Create a FrenetBSplineTrajectory with CircularReference (κ_r=1/R)."""
     ref_path = CircularReference(radius)
-    return FrenetBSplineTrajectory(OUTPUT / "bspline_basis.npz", ref_path)
+    return FrenetBSplineTrajectory(BASIS / "bspline_basis.npz", ref_path)
 
 
 def test_round_trip_curved():

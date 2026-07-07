@@ -17,18 +17,18 @@ import jax, jax.numpy as jnp
 import numpy as np
 from jax import random
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from Cartest.frenet_traj import FrenetBSplineTrajectory
-from Cartest.reference_path import StraightReference
-from Cartest.warmstart import build_initial_mu
-from Cartest.cost import make_objective, build_context
-from Cartest.execute import execute_perfect_tracking, FrenetState
-from Cartest.constraints import make_constraints, compute_g_values, compute_summary
-from Cartest.scenario import EMPTY as scenario
+from Cartest.core.frenet_traj import FrenetBSplineTrajectory
+from Cartest.core.reference_path import StraightReference
+from Cartest.planning.warmstart import build_initial_mu
+from Cartest.planning.cost import make_objective, build_context
+from Cartest.execution.execute import execute_perfect_tracking, FrenetState
+from Cartest.planning.constraints import make_constraints, compute_g_values, compute_summary
+from Cartest.planning.scenario import EMPTY as scenario
 from gmm_igo.solver_builder import build_solver
 
-OUTPUT = Path(__file__).resolve().parent
+BASIS = Path(__file__).resolve().parents[1] / "basis"
 
 
 @dataclass
@@ -70,7 +70,7 @@ def run_eval(steps=150, seed=0, window=20):
         list of EvalMetrics, one per step.
     """
     ref_path = StraightReference()
-    gen = FrenetBSplineTrajectory(OUTPUT / "bspline_basis.npz", ref_path)
+    gen = FrenetBSplineTrajectory(BASIS / "bspline_basis.npz", ref_path)
 
     obs_list  = scenario["obstacles"]
     lane_hw   = scenario["lane_hw"]

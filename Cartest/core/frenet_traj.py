@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 from pathlib import Path
 
-from Cartest.reference_path import ReferencePath
+from Cartest.core.reference_path import ReferencePath
 
 
 class FrenetBSplineTrajectory:

@@ -53,24 +53,30 @@ IGO 黑箱优化 + Constran 约束引擎。
 
 ```
 Cartest/
-├── spline.py                # B 样条基函数预计算 (一次性)
-├── frenet_traj.py           # 核心: evaluate, to_vehicle_states,
-│                            │   from_vehicle_states, make_frenet_reference
-├── reference_path.py        # 参考线: StraightReference, CircularReference,
-│                            │   frenet_to_cartesian, cartesian_to_frenet
-├── scenario.py              # 场景配置 (障碍物 + 道路参数 + 初始状态)
-├── warmstart.py             # Warm-start: build_initial_mu
-├── cost.py                  # 目标函数 (2阶耦合 Lyapunov) + build_context
-├── constraints.py           # 约束构建 + compute_g_values + compute_summary
-├── execute.py               # 执行: execute_perfect_tracking / execute_point_mass
-├── vehicle_model.py         # 车辆模型 (PointMassModel: 摩擦圆积分)
-├── diagnostics.py           # 诊断: raw obj, g 值, 车辆当前状态
-├── reporting.py             # StepReport 记录
-├── plotting.py              # 可视化
-├── Simple.py                # MPC demo 主程序
-├── test_frenet_invert.py    # 16 个测试 (round-trip + spot-check + reference)
-├── eval_closed_loop.py      # 闭环评估 (收敛/超调/震荡/约束)
-└── bspline_basis.npz        # 预计算基函数矩阵 (10控点, 5次, 10s时域)
+├── Simple.py                    # MPC demo 主程序
+├── carreadme.md
+├── basis/                       # 离线预计算
+│   ├── spline.py                # → bspline_basis.npz
+│   └── bspline_basis.npz        # (10控点, 5次, 10s时域)
+├── core/                        # 核心变换 + 车辆模型
+│   ├── frenet_traj.py           # evaluate, to_vehicle_states,
+│   │                            # from_vehicle_states, make_frenet_reference
+│   ├── reference_path.py        # StraightReference, CircularReference,
+│   │                            # frenet↔cartesian
+│   └── vehicle_model.py         # PointMassModel (摩擦圆积分)
+├── planning/                    # MPC 规划
+│   ├── cost.py                  # 2阶耦合 Lyapunov + build_context
+│   ├── constraints.py           # 约束构建 (obs/lane/speed/acc/jerk)
+│   ├── warmstart.py             # build_initial_mu
+│   └── scenario.py              # 场景配置
+├── execution/                   # 执行
+│   └── execute.py               # execute_perfect_tracking / execute_point_mass
+└── eval/                        # 评估 + 测试
+    ├── diagnostics.py           # raw obj, g 值诊断
+    ├── reporting.py             # StepReport 记录
+    ├── plotting.py              # 可视化
+    ├── eval_closed_loop.py      # 闭环评估 (收敛/超调/震荡/约束)
+    └── test_frenet_invert.py    # 16 个测试
 ```
 
 ## 1. 地图 — ReferencePath
@@ -156,10 +162,7 @@ cost = Σ eᵀe + Σ (ė + K e)ᵀ(ė + K e) + Σ (ë + 2K ė + K² e)ᵀ(ë + 2
 K = [[ω_s, 0], [0, ω_d]]   — α=0 解耦，各通道独立
 ```
 
-收敛速率由 ω_s, ω_d 决定。实际闭环收敛受 B-spline + jerk 约束限制：
-- 横向: ~3s 下限 (ω_d≥4 后不再加速)
-- 纵向: ~5s 下限 (比横向慢，是瓶颈)
-- 耦合 α>0 破坏性——使两通道互相干扰，v 终值偏差增大
+收敛行为见下方 [Constructive Lyapunov 原理](#constructive-lyapunov-原理)。
 
 ### 参考轨迹生成
 
@@ -181,6 +184,79 @@ ref = make_frenet_reference(gen, ctx, {
 
 所有模式统一走 `vehicle-level y_ref → from_vehicle_states → z_ref` 管道，
 保证速度分解 `v² = (1−d·κ_r)²·s_dot² + d_dot²` 对直路和弯道都正确。
+
+### Constructive Lyapunov 原理
+
+当前 cost 是二阶 **Constructive Lyapunov Function (CLF)**。
+"Constructive" 的含义是从低阶到高阶逐层构造，每层引入更高阶导数作为
+"虚拟控制输入"，最终形成完整的 Lyapunov 函数。
+
+**构造层次：**
+
+```
+层0 (位置):     V₀ = ||e||²                           ← 纯几何误差
+层1 (速度):     V₁ = V₀ + ||ė + K·e||²                ← ė 作为"虚拟控制"驱动 e→0
+层2 (加速度):   V₂ = V₁ + ||ë + 2K·ė + K²·e||²       ← ë 作为"虚拟控制"驱动 ė→−K·e
+层3 (jerk, 可选): V₃ = …                              ← 需要 C2 夹紧 + 三阶 cost
+```
+
+每一层引入的"虚拟控制" `v_k = e^(k) + k·K·e^(k−1) + … + K^k·e`
+把上一层的收敛速率绑定到 K 的特征值。
+
+**为什么 α=0 解耦：** `K = [[ω_s, α], [α, ω_d]]`。α>0 时 s 和 d
+通道互相耦合——纵向速度误差会影响横向 cost，优化器被迫在两个目标间
+折中。实际测试显示 α=0.5 时 v 终值只能到目标的 80%。
+
+**收敛速率由 ω_s, ω_d 预设，但受 B-spline + jerk 约束限制：**
+- 横向: ~3s 收敛下限 (ω_d ≥ 4 后不再加速)
+- 纵向: ~5s 收敛下限 (比横向慢，是瓶颈)
+
+**为什么不夹紧 C2：** C2 夹紧强制 `d_ddot[0] = 0`。在当前 jerk 约束
+(|j|≤2.0) 和 0.1s 执行步长下，每个 MPC 步只能产生 ~0.001m 的横向位移，
+收敛时间超出合理范围。增加控制点数或加三阶 cost 项均无帮助——
+问题是物理性的：从零加速度起步需要 jerk 缓慢爬升。
+
+### 为什么需要正反变换 & 合理参考
+
+本项目的核心是跟踪 Frenet 状态 `z = (s, d, s_dot, d_dot, s_ddot, d_ddot, …)`。
+但参考信号来自外部——地图、场景、或 maneuver 描述——这些通常不在 Frenet 空间。
+
+**正变换 `to_vehicle_states`** 把优化器产出的 Frenet 轨迹映射到物理车辆状态，
+供约束检查（速度/加速度/jerk 必须满足物理极限）和诊断使用。
+曲率耦合项（`(1−d·κ_r)` Jacobian、离心、Coriolis）保证在弯道上也是对的。
+
+**反变换 `from_vehicle_states`** 把外部参考（GPS waypoints、地图 lane center、
+上层 planner 输出）从车辆/Cartesian 空间转回 Frenet 空间，生成 `z_ref`。
+
+**为什么不能直接在 Frenet 空间写 `s_dot_ref = v_ref`：**
+
+车辆运动学的基本关系是：
+
+```
+v² = (1 − d·κ_r)² · s_dot² + d_dot²
+```
+
+如果直接写 `s_dot_ref = v_ref` 同时 `d_dot_ref ≠ 0`（变道有横向速度），
+实际车速 `v_actual = √(v_ref² + d_dot_ref²) > v_ref`——参考本身就违反
+物理约束。弯道上还有 `(1−d·κ_r)` 的修正。
+
+**正确的管道：**
+
+```
+maneuver (如 "d → 3.5m, v → 20m/s")
+    │
+    ▼
+构建 vehicle-level 参考 y_ref(t) = (x,y,v,ψ,a_long,a_lat,…)
+    │  考虑路径几何 θ_r(s), κ_r(s)
+    │  保证 v² = (1−d·κ_r)²·s_dot² + d_dot²
+    ▼
+from_vehicle_states(y_ref) → z_ref = (s_ref, s_dot_ref, …, d_ref, d_dot_ref, …)
+    │
+    ▼
+Lyapunov cost 跟踪 z_ref
+```
+
+这个管道保证 `z_ref` 在几何上可行——无论直路弯道，`v_ref`, `d_ref`, `s_dot_ref` 三者始终满足运动学关系。
 
 ## 5. 执行
 
@@ -215,17 +291,17 @@ ctrl_s, ctrl_d = result.x[:gen.n_free], result.x[gen.n_free:]
 
 ```bash
 # 生成基函数矩阵 (只需一次)
-uv run python Cartest/spline.py
+uv run python Cartest/basis/spline.py
 
-# MPC demo
+# MPC demo (首次运行自动 JIT 预热)
 uv run python Cartest/Simple.py --steps 150 --seed 0
 uv run python Cartest/Simple.py --steps 50 --no-plot
 
 # 测试 (16个)
-uv run python Cartest/test_frenet_invert.py
+uv run python Cartest/eval/test_frenet_invert.py
 
 # 闭环评估
-uv run python Cartest/eval_closed_loop.py --steps 150
+uv run python Cartest/eval/eval_closed_loop.py --steps 150
 ```
 
 输出 `Cartest/frenet_demo.gif`。

@@ -11,20 +11,21 @@ from jax import random
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from Cartest.frenet_traj import FrenetBSplineTrajectory
-from Cartest.reference_path import StraightReference
-from Cartest.warmstart import build_initial_mu
-from Cartest.cost import make_objective, build_context
-from Cartest.execute import execute_perfect_tracking
-from Cartest.constraints import make_constraints, compute_g_values, compute_summary
-from Cartest.reporting import StepReport
-from Cartest.plotting import setup_axes, render_frame, save_animation
-from Cartest.diagnostics import diagnose, print_diag
-from Cartest.scenario import EMPTY as scenario
+from Cartest.core.frenet_traj import FrenetBSplineTrajectory
+from Cartest.core.reference_path import StraightReference
+from Cartest.planning.warmstart import build_initial_mu
+from Cartest.planning.cost import make_objective, build_context
+from Cartest.execution.execute import execute_perfect_tracking
+from Cartest.planning.constraints import make_constraints, compute_g_values, compute_summary
+from Cartest.eval.reporting import StepReport
+from Cartest.eval.plotting import setup_axes, render_frame, save_animation
+from Cartest.eval.diagnostics import diagnose, print_diag
+from Cartest.planning.scenario import EMPTY as scenario
 from gmm_igo.solver_builder import build_solver
 
 
-OUTPUT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent
+BASIS = ROOT / "basis"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -33,7 +34,7 @@ OUTPUT = Path(__file__).resolve().parent
 
 def run(steps=150, seed=0, plot=True):
     ref_path = StraightReference()
-    gen = FrenetBSplineTrajectory(OUTPUT / "bspline_basis.npz", ref_path)
+    gen = FrenetBSplineTrajectory(BASIS / "bspline_basis.npz", ref_path)
 
     # Build solver ONCE
     # ── Scenario ──
@@ -53,11 +54,16 @@ def run(steps=150, seed=0, plot=True):
 
     key = random.PRNGKey(seed)
 
-    from Cartest.execute import FrenetState
+    from Cartest.execution.execute import FrenetState
     init = scenario["init"]
     state = FrenetState(s=init["s"], s_dot=init["s_dot"], s_ddot=init["s_ddot"],
                         d=init["d"], d_dot=init["d_dot"], d_ddot=init["d_ddot"],
                         psi=init.get("psi", 0.0))
+
+    # ── JIT warm‑up: compile all JAX functions before the first timed step ──
+    ctx_warm = build_context(gen, state, v_target, lane_hw, obs_pos, obs_rad)
+    mu_warm = build_initial_mu(gen, state.s, state.s_dot, state.d)
+    _ = solver(random.PRNGKey(999), context=ctx_warm, initial_mu=mu_warm)
 
     if plot:
         fig, ax_t, ax_k = setup_axes()
@@ -109,13 +115,13 @@ def run(steps=150, seed=0, plot=True):
             print_diag(diagnose(gen, result.x, ctx, safe_dist, state))
 
     if plot:
-        np.savez(OUTPUT / "frenet_demo.npz",
+        np.savez(ROOT / "frenet_demo.npz",
                  hx=np.array(hx), hy=np.array(hy), hv=np.array(hv),
                  frames=np.array(frames, dtype=object))
         save_animation(fig, reports,
                        lambda i: render_frame(ax_t, ax_k, reports[i],
                                               obs_list, safe_dist, gen.dt),
-                       OUTPUT / "frenet_demo.gif")
+                       ROOT / "frenet_demo.gif")
 
 
 def _parse():
