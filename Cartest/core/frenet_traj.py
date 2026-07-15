@@ -144,8 +144,8 @@ class FrenetBSplineTrajectory:
         not optimization variables — so they don't introduce instability.
         For straight roads (κ_r=0) the formulas reduce to the simplified form.
         """
-        # Reference path geometry at s(t)
-        _, _, θ_r, κ_r = self.ref_path.evaluate(s)
+        # Reference path geometry at s(t) — lightweight: only θ, κ needed
+        θ_r, κ_r = self.ref_path.evaluate_kappa_theta(s)
         # κ_r' = dκ_r/ds — 0 for lines and circular arcs; ignored for now
 
         # ── Velocity ────────────────────────────────────────────

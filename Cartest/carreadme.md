@@ -559,14 +559,17 @@ Phase 2: 精炼 (fine, Frenet)
 
 #### 约束嵌套方向：两 Phase 相反
 
+Constran 的优先规则: **外层（priority 数字大）拥有最终话语权**。
+外层的违规信号直接进入最终 cost，不受内层掩盖。
+
 ```
-Phase 1 (探索):  obs 套 lane 套 speed 套 acc 套 jerk
-                障碍物在最外层——先确保绕行空间存在
+Phase 1 (探索):  obs (外, priority 最大) → lane → speed → acc → jerk (内)
+                obs 在最外层 — 安全是最终防线，拥有最高话语权
                 内层 jerk/acc 松 (ACC=8~10, JERK=5~8)，不限制探索
 
-Phase 2 (精炼):  jerk 套 acc 套 speed 套 lane 套 obs
-                jerk/acc 在最外层——先保证物理可行
-                障碍物在内层——z_ref 已解决几何，obs 仅作最后防线
+Phase 2 (精炼):  jerk (外, priority 最大) → acc → speed → lane → obs (内)
+                jerk/acc 在最外层 — 物理可行性是最终防线
+                obs 在内层 — z_ref 已解决几何，obs 仅作内层后备
 ```
 
 两个约束构建独立，由 `solver_modes` 在 build 时各自编译好，运行时零开销切换。
@@ -607,7 +610,7 @@ ctrl_d = d_start + (d_lane - d_start) * greville / total_time
 
 3. **障碍物约束生效需要足够的 IGO 轮次 + 样本。**
    T=300 B=128 以上才能让 P1 在约束边界附近找到可行轨迹。
-   约束嵌套方向（obs 在外）在探索阶段是正确的——先问"能过吗"，
+   约束嵌套方向（obs 在最外层，拥有最终话语权）在探索阶段是正确的——先问"能过吗"，
    再在可行空间内搜。
 
 #### 时序预算

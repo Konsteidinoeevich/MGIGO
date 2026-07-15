@@ -52,13 +52,27 @@ build_solver (solver='m22', T=300, K=3, B=64)
 - **C0+C1 夹紧**: B-spline 的 P0 (位置) 和 P1 (速度) 从当前车辆状态夹紧, 保证轨迹连续性。
 - **5 次 B 样条, 10 控制点, 10s 时域, 100 采样点**: 当前基配置不变。
 
-### 1.3 两阶段的核心假设
+### 1.3 两阶段的本质：一个优化问题，分阶段求解
 
-> **假设**: 将"探索可行空间"和"精细跟踪参考"拆成两个阶段, 各自用最合适的 cost 和约束配置, 总收敛质量优于单阶段。
+Phase 1 和 Phase 2 **不是两个独立过程**——它们是**同一个优化问题的两个阶段**。
+拆分仅因单个 IGO 配置（单组 cost + 单组约束 + 单组超参）不够灵活，
+无法同时处理"语义选择"和"精细跟踪"。
+
+```
+一个优化问题: 从当前状态出发，安全、高效地到达目标
+    │
+    ├─ Phase 1: 选语义 (左绕/右绕/直行) + 满足前向不变集 + 分配速度
+    │           地图 warm start 给 GMM 分量不同的车道语义
+    │           碰撞约束 = 时空占位不重叠 (前向不变集)
+    │           速度不做预设，由 Constran 约束决定
+    │
+    └─ Phase 2: 跟踪 Phase 1 产出的 z_ref
+                Lyapunov 全三层 + 紧约束 → 物理可行的执行轨迹
+```
 
 具体来说:
-- **Phase 1** 用小 dt (0.15) 保持 GMM 多模态 → 左绕/右绕并行探索 → cost gap 自然淘汰
-- **Phase 2** 用大 dt (0.30) 快速收敛 → 锁死 Phase 1 选定的方向 → Lyapunov 纯跟踪
+- **Phase 1** 用地图多车道 warm start 保持 GMM 多语义分量 → 左绕/右绕/直行并行评估 → cost gap 自然淘汰
+- **Phase 2** 从 Phase 1 的 GMM 状态 warm start → 锁死选定语义 → Lyapunov 纯跟踪
 
 ## 2. 总体架构
 
@@ -83,8 +97,9 @@ build_solver (solver='m22', T=300, K=3, B=64)
   │ Phase 1: 行为决策 (每 MPC 步)                             │
   │   solver mode: 'active' / 'aggressive'  (或 MPC_G_MS)    │
   │   warmstart: 地图多车道 (左/中/右 lane center)             │
-  │   cost: 采样点 Cartesian 距离 → 目标 lane 最小化           │
-  │   约束嵌套: obs ⊃ lane ⊃ speed ⊃ acc  (松约束)            │
+  │   cost: Σ(d−d_lane)² (裸均方差, s 无 cost)                  │
+  │   约束嵌套: 由外到内 obs(外) → lane → speed → acc → jerk(内)   │
+│              obs 在最外层 (priority 最大) — 安全是最终防线      │
   │   IGO: dt=0.15, K=3, GMM 各分量对应不同车道                │
   │   输出: B-spline ctrl (Frenet)                            │
   │         ├─ gen.evaluate() → z_ref ──────────→ Phase 2     │
@@ -96,7 +111,8 @@ build_solver (solver='m22', T=300, K=3, B=64)
   │ Phase 2: 轨迹精炼 (同一 MPC 步内)                          │
   │   solver mode: 'standard' / 'conservative'               │
   │   cost: Lyapunov 纯跟踪 z_ref (8 个参考量)                │
-  │   约束嵌套: jerk ⊃ acc ⊃ speed ⊃ lane ⊃ obs  (紧约束)   │
+  │   约束嵌套: 由外到内 jerk(外) → acc → speed → lane → obs(内)   │
+│              jerk 在最外层 (priority 最大) — 物理可行是最后防线  │
   │   IGO: dt=0.30, K=3, T_0 大 (不重置, 锁定方向)           │
   │   输出: B-spline ctrl → 最终执行轨迹                      │
   └──────────────────────┬──────────────────────────────────┘
@@ -126,7 +142,7 @@ ctx  = build_context(state, ...)
 mu   = warmstart_multilane(gen, state, map_lanes)  # K=3 分量各追一条车道
 
 # Phase 1: 行为决策
-#   cost: 采样点 Cartesian 距离 → 目标 lane 最小化 + Constran 约束
+#   cost: Σ(d−d_lane)² (裸均方差, s 无 cost) + Constran 约束
 result_p1 = modes.solve('active', key1, ctx, mu)
 
 # z_ref 直接由 B-spline evaluate 得到 (同基, 不需要转换)
@@ -241,7 +257,22 @@ Phase 2 Lyapunov cost 跟踪 z_ref
 
 **缓解**: `from_vehicle_states` 在管道末端纠正残差 — `_build_vehicle_reference` 构建的 `y_ref` 经 `from_vehicle_states` 反解后, `z_ref` 与原始 `y_ref` 的运动学关系是自洽的（因为反解用的是同一套 `to_vehicle_states` 公式的逆）。
 
-### 3.6 在两阶段管线中的位置
+### 3.6 Frenet 等价类与坐标架
+
+Frenet 坐标系通过参考路径定义。在 κ_r ≠ 0 的路径上, s 具有周期性:
+`s ≡ s + 2nπR (n ∈ ℤ)` — 无限多个 s 值映射到同一 Cartesian 点。
+圆心 (d = −R) 是所有 s 的像——这是 Frenet 坐标系的奇点。
+
+B-spline 在 Frenet 空间优化 ctrl。如果 s 不受约束, B-spline 可能漂移到等价类的
+另一个代表 (s + 2πR 处的"相同"轨迹), 导致 sin/cos 在大 s 下 float32 精度衰减 → 爆炸。
+
+**`make_frenet_reference` 的作用**: 不是"参考轨迹", 而是**随车移动的 Frenet 坐标架**。
+它建立一个单调递增的 `s_ref(t) = s0 + v·t`, 选取等价类中的一个特定代表,
+使 s 始终在 [s0, s0+v·T] 范围内。Phase 1 在架内优化 d, 不跟踪 s_ref。
+
+直路 (κ_r = 0): s = x, d = y, 无周期性, 无奇点。Frenet = Cartesian, 不需要显式坐标架。
+
+### 3.7 在两阶段管线中的位置
 
 ```
 Phase 1 (Frenet 空间, 行为决策)
@@ -269,16 +300,20 @@ from_vehicle_states → z_ref
 Phase 1 或 Phase 2 (直接跟踪)
 ```
 
-## 4. Phase 1: 行为决策
+## 4. Phase 1: 语义选择 + 前向不变集
 
 ### 4.1 本质
 
-Phase 1 的**本质是行为决策**，不是轨迹优化。它回答"做什么"的问题：
-- 保持当前车道还是变道？
-- 走左边还是右边绕过障碍物？
-- 目标速度是多少？
+Phase 1 和 Phase 2 是**同一个优化问题的两个阶段**。拆分仅因单个 IGO 配置不够灵活。
 
-Phase 2 负责"怎么做"——把决策转成物理可行的轨迹。
+Phase 1 回答三个问题：
+1. **语义**: 左绕、右绕、还是直行？（行为语义，来自地图 warm start）
+2. **前向不变集**: 时间推演下，冲突区域内各车轨线不重叠？（碰撞约束）
+3. **速度分配**: s 无 cost, 速度由 V_MIN/V_MAX + acc 约束决定
+
+**前向不变集 (Forward Invariant Set)**: B-spline 的 T=100 采样点天然携带时间 `(x[t], y[t])`。
+碰撞检测只需检查**同时间步**各车空间是否重叠——时空占位不重叠 = 前向不变。
+当前用 RSS 距离 (`dist[t] < safe → violation`)，日后可升级为 ESDF 栅格占位。
 
 ### 4.2 输入与输出
 
@@ -290,36 +325,44 @@ Phase 2 负责"怎么做"——把决策转成物理可行的轨迹。
 | | 其他 Agent 状态 (交互场景) | 感知/预测 |
 | **输出** | z_ref (8 个 Frenet 参考量) | B-spline evaluate 直接产出 |
 | | y_ref [T×9] (车辆级, 约束检查+诊断) | to_vehicle_states(z_ref) |
-| | 模态选择 (左/中/右车道, cost gap 决定) | GMM π 分布 |
+| | 语义选择 (左/中/右车道, cost gap 决定) | GMM π 分布 |
+| | 速度分配 (无预设, 优化结果) | B-spline s-channel ctrl |
 
-### 4.3 Warmstart: 地图多车道
+### 4.3 Warmstart: 地图语义引导
 
-Phase 1 的 warmstart 来自**地图提供的车道中心线**。每个 GMM 分量 (K=3) 初始化为不同车道:
+Phase 1 的 warmstart 来自**地图提供的车道中心线**。每个 GMM 分量 (K=3) 初始化为不同车道，
+**携带行为语义**:
 
 ```python
-# 每个模态对应一条车道
-d_lanes = [-3.5, 0.0, 3.5]  # 左/中/右车道中心线 (Frenet d 坐标)
+# 每个分量对应一种行为语义
+d_lanes = [-3.5, 0.0, 3.5]  # 左绕 / 直行 / 右绕 (Frenet d 坐标)
+# 语义还可以包含目标变更:
+#   断头路: d_lanes = [d_detour_1, d_detour_2, d_original]  (临时换目标)
+#   绕行:   d_lanes = [d_left, d_center, d_right]          (目标不变, 中间借道)
 
 for k in range(K):
     ctrl_d[k] = [d_lanes[k]] * n_free    # 全车道常数 d
-    ctrl_s[k] = s0 + v0 * greville        # 匀速外推
+    ctrl_s[k] = s0 + v0 * greville        # 匀速外推 (初始猜测, 不是预设)
 ```
 
-**为什么不用 ramp 外推**: ramp 外推 (手工构造 d 从当前值渐变到目标) → 数值爆炸, cost 无法区分模态。
+**语义引导机制**:
+- 地图告诉 GMM"有哪些可能的行为"（左绕/右绕/直行）——但不告诉"哪个更好"
+- IGO 在前向不变集约束 + d_lane 目标下并行评估各语义分量
+- cost gap 自然淘汰: 不可行的语义 (如左绕路径被挡) π→0, 可行的 π→1
+
+**为什么不用 ramp 外推**: ramp 外推 (手工构造 d 渐变) → 数值爆炸, cost 无法区分语义分量。
 全车道 warmstart → B-spline C0/C1 夹紧自动处理从当前 `d0` 到目标车道的过渡。
 
 参考: [warmstart.py:26](planning/warmstart.py#L26) `tangent_warmstart` 已实现 Greville 匀速外推。
-需要新增: `build_multilane_mu` — 多车道 GMM 初始化。
+需要新增: `build_multilane_mu` — 多车道语义 GMM 初始化。
 
 ### 4.4 Cost 设计: 地图引导
 
-Phase 1 的 cost 是**采样点到目标 lane 的 Cartesian 距离最小化**，
-所有几何可行性（障碍物、车道边界）由 Constran 的 σ 嵌套约束自动处理。
+Phase 1 的 cost: `mean((d−d_lane)²)`,弱偏好车道, s 无 cost。避障全在 Constran obs 约束 (最外层, priority 最大 — 安全是最终防线)。`make_frenet_reference` 提供随车移动的 Frenet 坐标架 (非参考轨迹)。速度由约束决定, 无预设。
 
 ```
-cost_P1 = Σ_w_i · distance(y_sample_i, lane_center)²
-        + Σ (s_dot − v_target)²                      ← 最轻速度引导
-        + Constran σ 嵌套约束                         ← 几何可行性自动处理
+原始raw cost_P1 =  Σ (d − d_lane)²               ← 唯一 cost: 弱车道偏好 
+        然后所有都走 Constran σ 嵌套约束                   ← obs 在最外层驱动避障 (拥有最终话语权), speed/acc 在内层决定速度
 ```
 
 **核心原则**: **不手工拼权重**。手工加权和 → 7 位有效数字不够用 → 数值发散。
@@ -329,21 +372,24 @@ cost_P1 = Σ_w_i · distance(y_sample_i, lane_center)²
 
 | | Phase 1 cost | Phase 2 cost |
 |------|-------------|-------------|
-| 目标 | 选车道, 定方向 | 跟踪 z_ref, 产轨迹 |
-| 空间 | Cartesian (地图几何) | Frenet (Lyapunov 跟踪) |
-| 约束角色 | 约束定义可行空间, cost 只做最轻引导 | cost 主导收敛, 约束保证物理可行 |
+| 目标 | 选车道 (d_lane), 速度分配 | 跟踪 z_ref, 产轨迹 |
+| s 通道 | 无 cost, Frenet 坐标架 | 全 Lyapunov 跟踪 z_ref(t) |
+| d 通道 | `mean((d−d_lane)²)` | 2 阶 Lyapunov 跟踪 z_ref |
+| 碰撞/交互 | Constran obs 约束 (priority 最大, 最外层) | Constran 约束 |
+| 速度 | cost + 约束共同优化 | 跟踪 z_ref 的 s_dot_ref |
 
 ### 4.5 约束嵌套方向
 
+Constran σ 嵌套的优先规则: **外层 (priority 数字大) = 最终话语权高**。
+约束按照由外到内排列 (外层优先级最高):
+
 ```
-obs ⊃ lane ⊃ speed ⊃ acc ⊃ jerk
+obs (外, priority 最大) → lane → speed → acc → jerk (内, priority 最小)
 ```
 
-- **障碍物在最外层** (priority=1, mode='hard'): 先确保绕行空间存在
+- **obs 在最外层 (priority 最大, mode='hard')**: 安全是最终防线, 拥有最高话语权。外层违规时直接压制内层所有信号
 - **内层 jerk/acc 松** (ACC=8~10, JERK=5~8): 不限制探索, 允许粗糙轨迹
 - Phase 2 会重新施加紧约束 — Phase 1 的粗糙在 Phase 2 被修正
-
-当前 `constraints.py` 的嵌套方向 (obs outer) 已满足 Phase 1 需求, 不需要反转。
 
 ### 4.6 Solver 配置
 
@@ -423,18 +469,20 @@ def make_objective_cross_order(gen, omega_z=1.0, omega_w=4.0,
 
 ### 5.3 约束嵌套方向
 
+Constran 的优先规则: **外层 (priority 数字大) = 最终话语权**。
+
 **设计假设** (需要验证):
 
 ```
-jerk ⊃ acc ⊃ speed ⊃ lane ⊃ obs
+jerk (外, priority 最大) → acc → speed → lane → obs (内, priority 最小)
 ```
 
 **与 Phase 1 相反**:
-- **jerk/acc 在最外层** (priority=1~2): 先保证物理可行
-- **障碍物在内层** (priority=5): `z_ref` 已解决几何, obs 仅作最后防线
+- **jerk/acc 在最外层 (priority 最大)**: 物理可行性拥有最终话语权, 是最终防线
+- **obs 在内层 (priority 最小)**: `z_ref` 已解决几何, obs 仅作内层后备, 被外层 jerk/acc 包裹
 
-**当前状态**: [constraints.py:56](planning/constraints.py#L56) `make_constraints` 的嵌套方向固定为 obs-outer。
-**原型阶段**: 两个 Phase 可先用同一方向 (obs-outer)，验证两阶段架构可行后再做对照实验决定是否需要反转。
+**当前状态**: [constraints.py:56](planning/constraints.py#L56) `make_constraints` 的嵌套方向是 jerk 在外 (priority=5) → obs 在内 (priority=1)。
+**原型阶段**: 两个 Phase 可先用同一方向, 验证两阶段架构可行后再做对照实验决定 P2 是否需要反转。
 
 ### 5.4 Solver 配置
 
@@ -561,7 +609,7 @@ Frenet → to_vehicle_states → vehicle [T×9] → from_vehicle_states → Fren
 | # | 任务 | 涉及文件 | 依赖 |
 |---|------|---------|------|
 | 1 | Cost 函数支持外部 `z_ref` (Phase 2 纯跟踪) | `cost_transform.py` | 无 |
-| 2 | Phase 1 cost: 地图引导版本 (Cartesian→lane 距离) | 新文件 `planning/cost_phase1.py` | 无 |
+| 2 | Phase 1 cost: mean((d−d_lane)²) | 新文件 `planning/cost_phase1.py` | 无 |
 | 3 | 多车道 warmstart (`build_multilane_mu`) | `warmstart.py` 扩展 | 无 |
 | 4 | 两阶段 MPC 步编排 (同基直接传递 z_ref) | 新文件 `Simple_two_phase.py` | #1, #2, #3 完成后 |
 | 5 | Phase 1 + MPC_G_MS.py 集成 (交互博弈场景) | `Simple_two_phase.py` 或新文件 | #4 完成后 |
@@ -587,30 +635,30 @@ if z_ref is not None:
 
 同样改动 `make_objective_transform`。
 
-#### 任务 2: Phase 1 cost — 地图引导
+#### 任务 2: Phase 1 cost — 裸 d-偏好 (s 无 cost)
 
 **新文件**: `Cartest/planning/cost_phase1.py`
 
-Phase 1 的 cost 是采样点的 Cartesian 坐标到目标 lane 中心线的距离最小化。
+Phase 1 的 cost: `mean((d−d_lane)²)` — 裸均方差, s 无 cost。`make_frenet_reference` 提供 κ_r-正确的 Frenet 坐标架（不是参考轨迹，不跟踪它），Phase 1 在架内优化 d。
 不手工拼权重 — 几何可行性由 Constran 约束自动处理。
 
 ```python
-def make_objective_phase1(gen, lane_centers: list[float]):
-    """Phase 1: 地图引导 — 采样点 Cartesian 距离→lane 最小化.
-
-    Args:
-        gen: FrenetBSplineTrajectory
-        lane_centers: Frenet d 坐标列表, 如 [-3.5, 0.0, 3.5]
-                      每个 GMM 分量追一条车道
-    """
+def make_objective_phase1(gen):
+    """Phase 1: 裸 d-偏好, s 无 cost."""
     def obj_fn(theta, ctx):
-        s, d, s_dot, d_dot, ... = _eval_all(gen, theta, ctx)
-        # Cartesian 位置 (用于障碍物距离计算在约束中)
-        # cost 只做最轻引导: 速度 + 车道吸引
-        v_tgt = ctx["v_ref"][0]
-        return jnp.sum((s_dot - v_tgt) ** 2)
-        # 车道选择由 warmstart 的 GMM 分量 + Constran 约束实现
-        # 不手工加 d→lane 的 penalty — 交给 IGO 自然淘汰
+        _, d, _, _, _, _, _, _ = gen.evaluate(
+            theta[:n], theta[n:], ctx['s0'], ctx['s_dot0'], 0,
+            ctx['d0'], 0, 0)
+        d_lane = ctx.get('d_lane', 0.0)
+        return jnp.mean((d - d_lane)**2)
+    return obj_fn
+    """Phase 1: 弱车道偏好, s 无 cost. 避障由 obs 约束驱动."""
+    def obj_fn(theta, ctx):
+        _, d, _, _, _, _, _, _ = gen.evaluate(
+            theta[:n], theta[n:], ctx['s0'], ctx['s_dot0'], 0,
+            ctx['d0'], 0, 0)
+        d_lane = ctx.get("d_lane", 0.0)
+        return  jnp.mean((d - d_lane)**2)
 
     return obj_fn
 ```
@@ -711,7 +759,7 @@ else:
 **操作**: 实现任务 #1~#4 的最小版本, 在 `THREE_BLOCKING` 场景下跑通。
 
 **原型简化**:
-- Phase 1 cost: 地图引导 (最轻速度引导, 车道选择由 warmstart + Constran 实现)
+- Phase 1 cost: `mean((d−d_lane)²)` 
 - z_ref: Phase 1 的 B-spline evaluate 直接产出 → Phase 2 (**不经过** from_vehicle_states)
 - 约束: 两个 Phase 都用当前 obs-outer 方向 (Phase 2 暂不反转)
 - 不实现 MPC_G_MS.py 集成
@@ -735,7 +783,7 @@ Phase 1 的 GMM 多模态能正确淘汰 (cost gap 区分左/中/右车道)。
 | 多模态正确率 | Phase 1 选对车道 > 90% |
 
 **对照实验**:
-- 约束嵌套方向 (Phase 1 obs-outer, Phase 2 physics-outer) vs 两阶段都用同一方向
+- 约束嵌套方向 (Phase 1 obs-outer priority 最大, Phase 2 jerk-outer priority 最大) vs 两阶段都用同一方向
 - 同基 warmstart vs 独立 warmstart
 
 ### Step 5: 正反变换精度
@@ -775,8 +823,8 @@ Phase 1 的 GMM 多模态能正确淘汰 (cost gap 区分左/中/右车道)。
 
 **操作**: 从简单地图引导迭代到更智能的决策:
 
-1. **基线 (地图引导)**: Phase 1 的 cost = 最轻速度引导, 车道选择完全由 warmstart + Constran 实现
-2. **显式车道选择**: Phase 1 cost 加入 lane affinity term — 根据场景（障碍物分布、交通规则）偏置某些车道
+1. **基线**: Phase 1 cost = `mean((d−d_lane)²)`, s 无 cost, 避障由 obs 约束 (priority 最大, 最外层) 驱动
+2. **显式车道选择**: 地图 warmstart 给 GMM 分量不同 d_lane, cost gap 自然淘汰
 3. **交互博弈**: 引入 MPC_G_MS.py 处理多 Agent 场景
 
 **通过标准**: 迭代后的决策质量在复杂场景 (多障碍物、多 Agent) 下优于基线。
@@ -897,7 +945,7 @@ T = [[1,  α],
 | **B-spline (Frenet)** | s 沿弧线、d 横向偏移。C0+C1 夹紧在 κ_r≠0 时仍正确 |
 | **Constran lane** | `|d| ≤ lane_hw` 在弯道上 — d=0 是环道中心线（不是被 κ_r 扭曲的 Cartesian y） |
 | **Constran speed/acc/jerk** | v/a/j 通过 `to_vehicle_states` → 曲率耦合自动进入物理约束 |
-| **Phase 1 cost** | Cartesian 空间中距目标车道 — 目标车道在弯道上，必须通过 ref_path 正确映射 |
+| **Phase 1 cost** | `mean((d−d_lane)²)` — 裸 d-偏好, s 无 cost, 弯道上需 Frenet 坐标架 |
 | **MPC_G_MS** | 多 Agent 在共享 CircularReference 上博弈：同时采样、同时评估、同时更新 |
 | **GMM warmstart** | K=3 模态 = {加速进入, 匀速等待, 减速让行}，在弯道 Frenet 空间中初始化 |
 
@@ -1050,92 +1098,43 @@ cost_agent_i = Constran.build(
 )
 ```
 
-**嵌套语义**:
-- 内层 (lane/speed/acc/jerk): 物理可行约束 — 满足时才谈得上安全
-- 外层 (collision): 与他车的安全距离 — 在物理可行的前提下避免碰撞
-- Constran 自动处理 σ 嵌套: 外层满足时内层信号无损; 外层违反时压制内层
+**嵌套语义** (由外到内, Constran 中 priority 数字大 = 外层 = 最终话语权高):
+- **最外层** (collision, priority 最大): 与他车的安全距离 — 最终防线, 拥有最高话语权
+- **内层** (lane/speed/acc/jerk, priority 较小): 物理可行约束 — 满足时信号透过外层无损传递
+- Constran 自动处理 σ 嵌套: 外层满足时内层信号无损传递; 外层违反时直接压制内层所有信号
 
-#### goal_cost_i: 时空联合 + Lyapunov 指导
+#### goal_cost_i: 裸 d-偏好, s 无 cost
 
-**核心设计**: Phase 1 的 goal_cost 是**时空联合**的 — 它描述"在什么时间、到达什么位置"。
-s(t) 和 d(t) 构成一条时空曲线。Lyapunov 理论保证这条曲线不振荡（用到层0+1），但不要求
-加速度/jerk 质量（那是 Phase 2 + Constran 紧约束的职责）。
+**核心设计**: Phase 1 直接优化 d，不跟踪任何参考。s 通道无 cost。
 
 ```
-goal_cost_P1 = Σ e_d²              ← 空间 (层0): 横向位置正确
-             + Σ e_t²              ← 时间 (层0): 进度速率正确
-             + Σ (d_dot + ω_d·e_d)² ← 层1: d 通道不振荡 (Lyapunov 虚拟控制)
+goal_cost_P1 = Σ (d − d_lane)²    ← 唯一 cost: 偏好目标车道, 不加权重
 ```
 
-**不包含加速度/jerk 误差** — Phase 1 不关心"如何实现"，只关心"去哪、多快"。
-加速度/jerk 由 Constran loose 约束 (ACC=8~10, JERK=5~8) 兜底。
+- **s 通道**: 无 cost。`make_frenet_reference` 提供随车移动的 Frenet 坐标架。速度由 V_MIN/V_MAX + acc 约束决定。
+- **d 通道**: `(d−d_lane)²`, 裸均方差。obs 约束 (hard, priority 最大, 最外层) 覆盖避障 — 安全是最终防线。
+- **坐标架**: `make_frenet_reference` 不是参考轨迹。它建立单调 s_ref = s0+v·t, 消除等价类 s ≡ s+2nπR (n∈ℤ), 使 Frenet 坐标架良定义。Phase 1 在架内优化, 不跟踪它。
 
-**s 通道**: 不追求精确位置跟踪。s 通道的"目标"是时间进度 — `s_dot ≈ v_ring`
-代表"在合理时间内到达"。精确的 s 位置由 Phase 2 的 Lyapunov cost 负责。
+**与 Phase 2 的本质区别**:
 
-**d 通道**: 使用 Lyapunov 层1 虚拟控制 `v1_d = d_dot + ω_d·e_d`。
-保证横向收敛不振荡。ω_d 应 ≤ Phase 2 的 ω_d (通常 4.0~6.0)，
-确保 Phase 1 不要求 Phase 2 做不到的横向收敛速率。
+| | Phase 1 | Phase 2 |
+|------|---------|---------|
+| cost | `mean((d−d_lane)²)` | 全 Lyapunov V0+V1+V2 |
+| 坐标架 | `make_frenet_reference` (随车坐标架) | z_ref (Phase 1 输出) |
+| 约束嵌套 | **obs 最外层** (priority 最大) → lane → speed → acc → jerk (内) | **jerk 最外层** (priority 最大) → acc → speed → obs → lane (内) |
+| 速度 | 约束决定, 无预设 | 跟踪 z_ref 的 s_dot_ref |
 
-**Ego** (进入→环行→离开):
+**P1 cost 实现**:
 
 ```python
-def goal_cost_ego(theta, ctx, gen):
-    """时空联合 goal_cost: 进入环道 → 环行 → 离开.
-
-    空间 (d): 进入期 d→0, 环行期 d=0, 离开期 d→d_exit
-    时间 (s_dot): 全程保持 v_ring 的进度速率
-    Lyapunov 层1: 保证 d 收敛不振荡
-    """
-    s, d, s_dot, d_dot, s_ddot, d_ddot, ... = gen.evaluate(
-        theta[:n], theta[n:], ...)
-
-    T = len(s)
-    t_arr = jnp.arange(T) * gen.dt
-    t_enter = int(T * 0.3)
-    t_exit  = int(T * 0.7)
-
-    # ── z_target(t): 时空目标曲线 ──
-    d_target = jnp.where(t_arr < t_enter * gen.dt, 0.0,      # 进入: d→0
-                jnp.where(t_arr < t_exit * gen.dt, 0.0,       # 环行: d=0
-                          ctx['d_exit']))                      # 离开: d→d_exit
-    s_dot_target = jnp.full(T, ctx['v_ring'])                  # 匀速进度
-
-    # ── 空间误差 (层0) ──
-    e_d = d - d_target
-
-    # ── 时间误差 (层0) ──
-    # s_dot 偏离 v_ring → 进度太快或太慢
-    e_t = s_dot - s_dot_target
-
-    # ── Lyapunov 层1: d 通道虚拟控制 ──
-    # v1_d = d_dot + ω_d·e_d → 0 保证横向收敛不振荡
-    omega_d = ctx.get('omega_d', 4.0)  # ≤ Phase 2 的 ω_d
-    v1_d = d_dot + omega_d * e_d
-
-    return (jnp.mean(e_d**2)     # 空间
-          + jnp.mean(e_t**2)     # 时间
-          + jnp.mean(v1_d**2))   # 收敛光滑性
+def goal_cost_p1(theta, ctx, gen):
+    """Phase 1: 裸 d-偏好, s 无 cost."""
+    _, d, _, _, _, _, _, _ = gen.evaluate(
+        theta[:n], theta[n:], ctx['s0'], ctx['s_dot0'], 0,
+        ctx['d0'], 0, 0)
+    d_lane = ctx.get('d_lane', 0.0)
+    return jnp.mean((d - d_lane)**2)
 ```
-
-**环行车** (Agent 1):
-
-```python
-def goal_cost_circulating(theta, ctx, gen):
-    """时空联合 goal_cost: 保持车道, 匀速环行."""
-    s, d, s_dot, d_dot, ... = gen.evaluate(theta[:n], theta[n:], ...)
-
-    e_d = d - ctx['d_lane']
-    e_t = s_dot - ctx['v_ring']
-    omega_d = ctx.get('omega_d', 4.0)
-    v1_d = d_dot + omega_d * e_d
-
-    return (jnp.mean(e_d**2)
-          + jnp.mean(e_t**2)
-          + jnp.mean(v1_d**2))
-```
-
-**入口B车** (Agent 2): 与 ego 同构，不同初始 s 和进入时机。
 
 #### 分量可行性评估
 
@@ -1144,25 +1143,32 @@ Phase 1 的 GMM (K=3) 优化结束后：
 - **cost 越小 → π 越大**（IGO 的自然淘汰机制）
 - 直接选 **max-π 分量**的 μ 作为 z_ref → Phase 2
 
-不需要多指标综合判断 — 好的 cost 构造（时空联合 + Constran 约束）保证
+不需要多指标综合判断 — 好的 cost 构造（1 阶 Lyapunov + Constran 约束）保证
 π 分布直接反映可行性。
 
-#### collision_g: 几何 RSS 碰撞约束 (Constran Deterministic)
+#### collision_g: 前向不变集 (时空占位检测)
 
-**核心思路**: 不依赖 Frenet s/d 解析分离，直接在 B-spline 的 T=100 个 Cartesian 采样点上做时空重叠检测。
-利用已有采样点评估冲突区域时间，不需要额外解析求解。
+**核心概念 — 前向不变集 (Forward Invariant Set)**:
+B-spline 的 T=100 采样点天然携带时间: 采样点 k 表示时刻 `t_k` 车辆在 `(x[t_k], y[t_k])`。
+碰撞检测只需检查**同时间步**各车空间是否重叠——这就是**时空占位**。
+时间推演下冲突区域不重叠 = **前向不变集**。
 
+当前用 RSS 距离实现 (Cartesian 距离 < 安全阈值 → violation)。
+日后可升级为 ESDF 栅格占位——每个采样点在时空栅格中"占据"一个格子, 两车占据同格 = 冲突。
+
+**RSS 实现**:
 ```
 对每个采样时刻 t (T=100):
   dist[t] = √((x_i−x_j)² + (y_i−y_j)²)                          ← Cartesian 距离
   safe[t] = v_i·ρ + v_i²/(2a) + v_j·ρ + v_j²/(2a) + margin     ← RSS 制动距离
-  violation[t] = max(0, safe[t] − dist[t])                       ← 违反量
+  violation[t] = max(0, safe[t] − dist[t])                       ← 时空占位重叠量
 ```
 
-**为什么用几何 RSS 而非 Frenet RSS**:
-- Cartesian 距离自动处理环岛 s 周期性和曲率 — 不需要手动 `mod 2πR`
-- 速度相关的 `safe[t]` 比固定 `safe_s`/`safe_d` 更物理（高速需要更大安全距离）
-- B-spline 已经产出了所有采样点的 Cartesian 坐标和速度 — 直接复用，零额外开销
+**为什么 B-spline 采样点天然支持前向不变集**:
+- 采样点自带时间同步 — 所有 Agent 的轨迹在相同的时间网格上评估
+- 同 t 空间重叠 = 时空冲突 — 不需要单独的"冲突时间预测"模块
+- B-spline 已经产出了所有 (x, y, v) — 直接复用, 零额外开销
+- RSS / ESDF / occupancy grid 都是前向不变集的不同实现方式
 
 ```python
 def make_collision_g_geometric(gen, agent_idx, all_init_states,
@@ -1176,7 +1182,7 @@ def make_collision_g_geometric(gen, agent_idx, all_init_states,
 
     作为 Constran Deterministic 约束:
       - mode='hard': 安全底线
-      - priority=5: 最外层
+      - priority=5: 最外层 (拥有最终话语权)
       - aggregate='max': 任何时刻违反即触发
     """
     n_free = gen.n_free
@@ -1266,41 +1272,36 @@ Constran 已支持非确定性约束类型（[Constran.py](../Constraintdealer/C
 
 ```python
 def build_agent_constran(gen, agent_idx, all_init_states, goal_cost_fn,
-                         lane_hw=3.5, R=20.0, omega_d=4.0):
+                         lane_hw=3.5, R=20.0):
     """为一个 Agent 构建 Constran — 包含 lane/speed/acc/jerk/collision.
 
-    goal_cost_fn: (theta, ctx) → scalar — 时空联合 goal_cost
-      gen 和 omega_d 通过闭包捕获 (Constran build 需要 obj_fn(x, ctx) 签名)
+    goal_cost_fn: (theta, ctx) → scalar — 1 阶 Lyapunov goal_cost
     """
     n_free = gen.n_free
-
-    # 将 gen 和 omega_d 闭包进 goal_cost
-    def objective_fn(theta, ctx):
-        return goal_cost_fn(theta, {**ctx, 'omega_d': omega_d}, gen)
 
     constraints = [
         # 内层: 物理约束 (Phase 1 用松约束 — 只兜底, 不要求舒适)
         *make_constraints(gen, lane_hw, obs_safe_dist=0.1,
                           acc_max=8.0, jerk_max=5.0),  # 松!
-        # 外层: 他车碰撞 (priority > 物理约束 → 更外层)
+        # 最外层: 他车碰撞 (priority 最大 → 最终话语权)
         Deterministic(
             make_collision_g_geometric(gen, agent_idx, all_init_states),
             mode='hard',      # 安全底线
-            priority=5,       # 最外层 (lane=1, speed=2, acc=3, jerk=4)
+            priority=5,       # 最外层 (lane=1 内层, speed=2, acc=3, jerk=4 内层)
             aggregate='max',
             transform='hard',
         ),
     ]
 
-    return Constran.build(objective_fn=objective_fn, constraints=constraints)
+    return Constran.build(goal_cost_fn, constraints)
 ```
 
 > **实验验证** (§11.3 2b): `Constran.build()` 方案已在 `Simple_game_2b_constran.py` 验证。
-> 对称场景下 mixed-strategy Nash 自发打破, 零手工调参。碰撞作为 `Deterministic(mode='hard', priority=5)` 自动平衡。
+> 对称场景下 mixed-strategy Nash 自发打破, 零手工调参。
 
 **关键设计点**:
-- **goal_cost 是时空联合的** (空间 + 时间 + Lyapunov 层1)，不加手工权重
-- **Constran 约束是松的** (acc=8.0, jerk=5.0) — 只兜底防数值爆炸，不追求舒适
+- **goal_cost 是 1 阶 Lyapunov** (V0 + V1, s/d 两通道对称)，不加手工权重
+- **Constran 约束是松的** (acc=8.0, jerk=5.0) — 只兜底, 不要求舒适
 - 碰撞 vs 车道 vs 速度之间的权衡全部由 Constran 的 σ 嵌套自动处理
 - Phase 1 的松约束产出的 z_ref 会有粗糙的 acc/jerk → Phase 2 用紧约束精炼
 
@@ -1315,20 +1316,12 @@ def make_fitness_fn_j(gen, all_init_states, lane_hw=3.5, R=20.0):
     """
     n_free = gen.n_free
 
-    # 预编译每个 Agent 的 Constran cost function
+    # 预编译每个 Agent 的 Constran cost (统一使用 goal_cost_p1)
     constran_fns = {}
     for agent_idx in range(3):
-        # goal_cost_fn 根据 Agent 角色选择
-        if agent_idx == 0:
-            goal_fn = goal_cost_ego
-        elif agent_idx == 1:
-            goal_fn = goal_cost_circulating
-        else:
-            goal_fn = goal_cost_ego
-
-        # Constran.build: goal_cost + lane/speed/acc/jerk/collision → 单一 cost
+        # Constran.build: goal_cost_p1 + constraints → 单一 cost
         constran_fns[agent_idx] = build_agent_constran(
-            gen, agent_idx, all_init_states, goal_fn, lane_hw, R)
+            gen, agent_idx, all_init_states, goal_cost_p1, lane_hw, R)
 
     def fitness_fn_j(agent_idx, joint_x_flat, ctx):
         """MPC_G_MS 调用的 fitness function.
@@ -1563,7 +1556,7 @@ result_p2 = modes.solve('standard', key2, ctx_p2, result_p1)
 3. 弯道上 κ_r ≠ 0 全程不崩溃
 4. 收敛质量不低于单阶段基线（Level 0b）
 
-**如果失败**: 查 Phase 1 warmstart 是否覆盖了正确车道，goal_cost 时空联合是否合理。
+
 
 ---
 
@@ -1682,13 +1675,50 @@ Agent 1: d0=0, 目标 d=0,  s0=100, 方向 −s
 
 | R | v | a_lat = v²/R | d 收敛 | 结论 |
 |---|----|-------------|--------|------|
-| 20m | 12→18 | 7.2~16.2 ❌ | d 从 −3 漂到 −4.8 | 约束冲突: IGO 发现 d<0 增大 R_eff 降低 a_lat, 形成错误局部最优 |
+| 20m | 12→18 | 7.2~16.2 ❌ | d 从 −3 漂到 −4.8 | **硬失败**: 车道偏离 1.8m |
 | 20m | 8→10 | 3.2~5.0 ✅ | −3→−0.01, 3.7s | 约束满足时完美收敛 |
 | 100m | 12→18 | 1.4~3.2 ✅ | −3→0.04, 3.9s | 全程安全, 无超调 |
 
-**物理规律**: `a_lat = v²/R`。`ACC_MAX=5.0` → `v_max = sqrt(5R)`。R=100m 时 v_max=22.4 m/s (80 km/h), 城市驾驶全程安全。R=20m 时 v_max=10 m/s, 初始 12 m/s 即违规。
+**R=20m 失败诊断**:
 
-**结论**: Frenet 跟踪在弯道上与直路行为一致 (R=100m 时 d 收敛时间、超调量与 StraightReference 完全相同)。问题不是代码 bug, 是真实的物理约束——单 IGO 在 cost 和约束冲突时找到数学对但物理错的局部最优。这正是两阶段设计的动机。
+R=20m, v=12 m/s, d=−3: `R_eff = R − d = 23m`, `a_lat = 12²/23 = 6.3 > 5.0` ❌。
+IGO 面临 cost 和约束的冲突:
+- cost (Lyapunov): 拉 d → 0, 拉 v → 18
+- 约束 (ACC_MAX=5.0): 压 a_lat ≤ 5.0
+
+IGO 发现的"解": **把 d 推到 −4.8** (进一步偏离车道中心!),
+因为 `R_eff = 20 − (−4.8) = 24.8m`, `a_lat = 12²/24.8 = 5.8` (虽然仍超标, 但比 6.3 好了)。
+IGO 还在同时降速 (v 从 12 降到 ~10), `10²/24.8 = 4.0` ✅。
+
+**数学上这是正确的局部最优** — cost+constraint 的总和确实被最小化了。
+**物理上这是硬失败** — 车为了"合法过弯"而偏出了车道 1.8m。
+
+这个失败不是调参能解决的——它是单阶段 IGO 在 cost 和约束冲突时的**结构性缺陷**。
+单阶段无法分离"找可行路径"和"跟踪路径"。这正是两阶段设计的根本动机:
+Phase 1 在前向不变集 + 物理约束下找可行空间, Phase 2 在可行空间内做精细跟踪。
+
+**物理规律**: `a_lat = v²/R_eff`, `R_eff = R − d`。`ACC_MAX=5.0` → 安全速度 `v_safe = sqrt(5·R_eff)`。
+R=100m 时 v_safe=22.4 m/s (80 km/h), 城市驾驶全程安全。R=20m 时 v_safe=10 m/s, 初始 12 m/s 即违规。
+
+**Phase 1 弯道避障实验** (R=100m, s_obs=30m):
+
+| 配置 | d@obs | v | 结果 |
+|------|-------|---|------|
+| P1: mean(d²) + obs 最外层 (priority 最大) | −1.27 | 13.7 | ✅ 右绕避开 (R=100) |
+| R=50 v0=10 | −3.13 | 7.4 | ✅ 大幅右绕 |
+| R=50/100 v0=14 | ~−0.2 | 12-13 | ⚠️ 微绕 (高速RSS安全区大, 小转角即够) |
+| P2: make_objective + obs | 0.00 | 14.0 | ❌ 直穿 |
+
+**P1/P2 cost 最终设计**:
+
+| | Phase 1 | Phase 2 |
+|------|---------|---------|
+| cost | `mean((d−d_lane)²)` | `make_objective` (全 Lyapunov) |
+| s 通道 | 无 cost, Frenet 坐标架 | Lyapunov 跟踪 z_ref |
+| 约束嵌套 | obs(外, priority 最大) → lane → speed → acc → jerk(内) | jerk(外, priority 最大) → acc → speed → obs → lane(内) |
+| 避障 | obs 约束驱动 | 跟踪 z_ref (已安全) |
+
+**弯道必须: `make_frenet_reference` 提供随车移动的 Frenet 坐标架。Phase 1 不跟踪它——只在架内优化。s 等价于 s + 2nπR (n∈ℤ)，坐标架消除等价类，防止数值爆炸。
 
 ### 11.2 Level 1: 两阶段 + 弯道
 
@@ -1748,15 +1778,15 @@ Agent 1: d0=0, 目标 d=0,  s0=100, 方向 −s
 - 对称: 两车同 s=0, 同 v=14, 同 d=−3 (同时变道到 d=0)
 - 不对称: Agent 0 从后方快速接近 (v=16, s=0, d=−3), Agent 1 在前方慢行 (v=8, s=8, d=0)
 
-**碰撞实现**: `Constran.build()` — 碰撞作为 `Deterministic(collision_g, mode='hard', priority=5)` 嵌入 σ 嵌套最外层。**零手工权重**。
+**碰撞实现**: `Constran.build()` — 碰撞作为 `Deterministic(collision_g, mode='hard', priority=5)` 放在 σ 嵌套最外层 (拥有最终话语权)。**零手工权重**。
 
 ```python
 constraints = [
-    Deterministic(lane_g,  mode='soft', priority=1),   # 内层
+    Deterministic(lane_g,  mode='soft', priority=1),   # 内层 (最终话语权最低)
     Deterministic(speed_g, mode='soft', priority=2),
     Deterministic(acc_g,   mode='soft', priority=3),
     Deterministic(jerk_g,  mode='soft', priority=4),
-    Deterministic(collision_g, mode='hard', priority=5), # 外层: 碰撞硬底线
+    Deterministic(collision_g, mode='hard', priority=5), # 最外层 (最终话语权最高)
 ]
 cost = Constran.build(goal_cost, constraints)
 ```

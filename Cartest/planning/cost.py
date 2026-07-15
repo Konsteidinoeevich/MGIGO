@@ -125,3 +125,27 @@ def make_objective(gen, omega_s: float = 1.0, omega_d: float = 1.0,
         return jnp.sum(term0) + jnp.sum(term1) + jnp.sum(term2)
 
     return obj_fn
+
+
+def make_objective_p1(gen, d_target: float = 0.0):
+    """Phase 1 cost: weak lane preference, s is unconstrained.
+
+    cost = mean((d − d_target)²)
+
+    Obstacle avoidance is handled by Constran constraints — the cost
+    itself only expresses the lane preference.  s-channel has no cost;
+    speed is determined entirely by V_MIN/V_MAX + acc constraints.
+    """
+    n = gen.n_free
+
+    def obj_fn(theta, ctx):
+        ctrl_s = theta[:n]
+        ctrl_d = theta[n:2 * n]
+        _, d, _, _, _, _, _, _ = gen.evaluate(
+            ctrl_s, ctrl_d,
+            ctx["s0"], ctx["s_dot0"], ctx["s_ddot0"],
+            ctx["d0"], ctx["d_dot0"], ctx["d_ddot0"],
+        )
+        return jnp.mean((d - d_target) ** 2)
+
+    return obj_fn

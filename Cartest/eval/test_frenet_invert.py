@@ -649,6 +649,119 @@ def test_circular_reference_round_trip():
     assert_allclose(κ_all, 1.0 / R * jnp.ones(50), atol=1e-6)
 
 
+def test_general_path_geometry():
+    """GeneralPath.evaluate() returns correct positions at s = 0, L/4, L/2, 3L/4, L.
+
+    Uses a simple sinusoidal S-bend with known geometry.
+    """
+    import sys, tempfile, os
+    from pathlib import Path as _Path
+    from Cartest.core.reference_path import GeneralPath as _GeneralPath
+
+    # Build a small test path: single-sine S-bend, R_min=50m, 100m long
+    sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+    from Cartest.basis.build_path import build_sinusoid, save_table
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path_file = _Path(tmp) / "test_path.npz"
+        data = build_sinusoid(R_min=50.0, n_cycles=1.0, L=100.0, ds=0.1)
+        save_table(data, path_file)
+
+        gp = _GeneralPath(str(path_file))
+
+        # s = 0: should be at origin, heading 0 (sin integral starts at 0)
+        x0, y0, th0, k0 = gp.evaluate(jnp.array(0.0))
+        assert_allclose(np.array(x0), np.array(0.0), atol=0.01)
+        assert_allclose(np.array(y0), np.array(0.0), atol=0.01)
+        # κ(s) = (1/50)·cos(2π·s/100), κ(0) = 1/50 = 0.02
+        assert_allclose(np.array(k0), np.array(0.02), atol=0.001)
+
+        # s = 50 (half-way): κ(50) = -0.02 (inverted)
+        x50, y50, th50, k50 = gp.evaluate(jnp.array(50.0))
+        assert_allclose(np.array(k50), np.array(-0.02), atol=0.001)
+
+        # s = 100 (end): κ(100) = 0.02 (back to max, same as start)
+        x100, y100, th100, k100 = gp.evaluate(jnp.array(100.0))
+        assert_allclose(np.array(k100), np.array(0.02), atol=0.001)
+
+
+def test_general_path_round_trip():
+    """GeneralPath: cartesian_to_frenet(frenet_to_cartesian(s,d)) = (s,d)."""
+    import sys, tempfile
+    from pathlib import Path as _Path
+    from Cartest.core.reference_path import GeneralPath as _GeneralPath
+
+    sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+    from Cartest.basis.build_path import build_sinusoid, save_table
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path_file = _Path(tmp) / "test_path.npz"
+        data = build_sinusoid(R_min=20.0, n_cycles=2.0, L=150.0, ds=0.05)
+        save_table(data, path_file)
+
+        gp = _GeneralPath(str(path_file))
+
+        s_in = jnp.linspace(10.0, 140.0, 20)
+        x, y = gp.frenet_to_cartesian(s_in, jnp.zeros_like(s_in))
+        s_out, d_out = gp.cartesian_to_frenet(x, y)
+
+        # Position should recover perfectly
+        assert_allclose(np.array(s_out), np.array(s_in), atol=0.01)
+        assert_allclose(np.array(d_out), np.zeros(20), atol=0.01)
+
+        # With offset
+        d_offsets = jnp.array([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+        s_fixed = jnp.full_like(d_offsets, 75.0)
+        x_off, y_off = gp.frenet_to_cartesian(s_fixed, d_offsets)
+        _, d_back = gp.cartesian_to_frenet(x_off, y_off)
+        assert_allclose(np.array(d_back), np.array(d_offsets), atol=0.02)
+
+
+def test_general_path_curved_round_trip():
+    """Full Frenet↔Vehicle round-trip through GeneralPath (variable curvature)."""
+    import sys, tempfile
+    from pathlib import Path as _Path
+    from Cartest.core.reference_path import GeneralPath as _GeneralPath
+    from Cartest.core.frenet_traj import FrenetBSplineTrajectory as _Gen
+
+    sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+    from Cartest.basis.build_path import build_sinusoid, save_table
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path_file = _Path(tmp) / "test_path.npz"
+        data = build_sinusoid(R_min=30.0, n_cycles=2.0, L=200.0, ds=0.05)
+        save_table(data, path_file)
+
+        gp = _GeneralPath(str(path_file))
+        basis = _Path(__file__).resolve().parents[2] / "Cartest" / "basis" / "bspline_basis.npz"
+        gen = _Gen(str(basis), gp)
+
+        T = gen.T
+        key = np.random.RandomState(42)
+        # Small excursions to stay within reasonable d range
+        s_in = jnp.array(key.uniform(20, 180, T))
+        d_in = jnp.array(key.uniform(-2, 2, T))
+        s_dot = jnp.array(key.uniform(5, 15, T))
+        d_dot = jnp.array(key.uniform(-1, 1, T))
+        s_ddot = jnp.zeros(T)
+        d_ddot = jnp.zeros(T)
+
+        # Forward
+        st = gen.to_vehicle_states(s_in, d_in, s_dot, d_dot,
+                                    s_ddot, d_ddot,
+                                    jnp.zeros(T), jnp.zeros(T))
+
+        # Inverse
+        s_out, d_out, s_dot_out, d_dot_out, s_ddot_out, d_ddot_out, _, _ = \
+            gen.from_vehicle_states(st[:, 0], st[:, 1], st[:, 2], st[:, 3],
+                                     st[:, 4], st[:, 5], st[:, 6], st[:, 7])
+
+        assert_allclose(np.array(s_out), np.array(s_in), atol=0.05)
+        assert_allclose(np.array(d_out), np.array(d_in), atol=0.05)
+        assert_allclose(np.array(s_dot_out), np.array(s_dot), atol=0.1)
+        assert_allclose(np.array(d_dot_out), np.array(d_dot), atol=0.05)
+
+
 if __name__ == "__main__":
     test_from_vehicle_states_round_trip()
     print("✓ test_from_vehicle_states_round_trip passed")
@@ -703,5 +816,14 @@ if __name__ == "__main__":
 
     test_circular_reference_round_trip()
     print("✓ test_circular_reference_round_trip passed")
+
+    test_general_path_geometry()
+    print("✓ test_general_path_geometry passed")
+
+    test_general_path_round_trip()
+    print("✓ test_general_path_round_trip passed")
+
+    test_general_path_curved_round_trip()
+    print("✓ test_general_path_curved_round_trip passed")
 
     print("\nAll tests passed.")

@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax import vmap, random, lax, jit
 import functools
-
+#from gmm_igo.igo_weights import compute_elite_weights
 # ======================================================================
 # I. 核心辅助函数 (支持异构维度掩码)
 # ======================================================================
@@ -125,6 +125,8 @@ def _step_fn(state, iter_data, M, K, B, B0, dt, dims_arr, T_0, fitness_fn, v_res
     f_vals = vmap(lambda s: fitness_fn(s, context))(samples_flat)
     ranks = jnp.argsort(jnp.argsort(f_vals)) 
     w_hat = jnp.where(ranks < B0, 1.0/B, 0.0)
+
+    #w_hat = compute_elite_weights(f_vals, B0)
 
     # 3. 块并行更新
     def update_block(m_idx):

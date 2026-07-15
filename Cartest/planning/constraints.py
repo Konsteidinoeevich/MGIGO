@@ -55,23 +55,31 @@ def _eval_vehicle_states(theta, ctx, gen):
 
 def make_constraints(gen, lane_hw: float, obs_safe_dist: float,
                      acc_max: float | None = None,
-                     jerk_max: float | None = None):
+                     jerk_max: float | None = None,
+                     d_min: float | None = None,
+                     d_max: float | None = None):
     """Build constraint list for Frenet B-spline MPC.
 
-    Self-similar σ nesting, priority flows from inner → outer:
-      P5 (内): jerk      — 控制输入, 最内层, 直接约束轨迹
-      P4:      acc       — 加速度约束
-      P3:      speed     — 速度约束
-      P2:      lane      — 车道约束
-      P1 (外): obstacle  — 安全约束, 最外层包裹
-    外层约束满足时，内层约束的物理意义才成立。
+    Self-similar σ nesting (outer = larger priority number = higher precedence):
+      P1 (inner):  obs       — obstacle safety
+      P2:          lane      — lane keeping
+      P3:          speed     — speed limits
+      P4:          acc       — acceleration
+      P5 (outer):  jerk      — comfort / control input
+    Outer constraints have the final say in the σ-nesting chain.
 
     Args:
+        lane_hw:  symmetric half-width when d_min/d_max are None
         acc_max:  override module‑level ACC_MAX (None → use default 5.0)
         jerk_max: override module‑level JERK_MAX (None → use default 2.0)
+        d_min:    lower lane boundary (Frenet d).  None → -lane_hw.
+        d_max:    upper lane boundary (Frenet d).  None → +lane_hw.
+                  Set d_max=0.0 to forbid right lane change, etc.
     """
     _acc_max = acc_max if acc_max is not None else ACC_MAX
     _jerk_max = jerk_max if jerk_max is not None else JERK_MAX
+    _d_min = d_min if d_min is not None else -lane_hw
+    _d_max = d_max if d_max is not None else lane_hw
 
     def obs_g(theta, ctx):
         """RSS: longitudinal + lateral safe distance per obstacle."""
@@ -84,77 +92,54 @@ def make_constraints(gen, lane_hw: float, obs_safe_dist: float,
         rho = obs_safe_dist
         a_brake = 8.0
 
-        # Longitudinal RSS — only penalise when approaching (v > 0)
-        # and when |dx| < d_RSS(v) — i.e. vehicle is too close for its speed
         d_rss = v * rho + v ** 2 / (2.0 * a_brake)                    # [T]
 
         dx = x[:, None] - ctx["obs_pos"][None, :, 0]                  # [T, N]
         dy = y[:, None] - ctx["obs_pos"][None, :, 1]                  # [T, N]
         r  = ctx["obs_rad"][None, :]                                   # [1, N]
 
-        # Longitudinal violation: too close for current speed
-        # Only when vehicle hasn't passed the obstacle (dx remains)
         pen_x = jnp.maximum(0., d_rss[:, None] + r - jnp.abs(dx))
-
-        # Lateral violation: not enough clearance
         pen_y = jnp.maximum(0., r - jnp.abs(dy))
 
         return jnp.maximum(pen_x, pen_y).max(axis=-1)  # worst axis × worst obs
 
     def lane_g(theta, ctx):
-        """Lane boundary |d| ≤ lane_hw.  d from Frenet directly."""
+        """Lane boundary: d_min ≤ d ≤ d_max.  d from Frenet directly."""
         _, d, _, _, _, _, _, _ = _eval_frenet(theta, ctx, gen)
-        return jnp.maximum(0., jnp.abs(d) - lane_hw)
+        return jnp.maximum(
+            jnp.maximum(0., _d_min - d),
+            jnp.maximum(0., d - _d_max),
+        )
 
-    def speed_g(theta, ctx):
-        """Speed V_MIN ≤ v ≤ V_MAX.  v from to_vehicle_states."""
-        st = _eval_vehicle_states(theta, ctx, gen)
+    def kinematics_g(theta, ctx):
+        """Fused speed + acc + jerk from a single to_vehicle_states call."""
+        st = _eval_vehicle_states(theta, ctx, gen)     # ← 1 call, shared
         v = st[:, 2]
-        return jnp.maximum(
-            jnp.maximum(0., V_MIN - v),
-            jnp.maximum(0., v - V_MAX),
-        )
-
-    def acc_g(theta, ctx):
-        """Acc: max(|long|-LIM, |lat|-LIM, |total|-LIM, 0) per sample."""
-        st = _eval_vehicle_states(theta, ctx, gen)
         a_long, a_lat = st[:, 4], st[:, 5]
-        am = jnp.sqrt(a_long ** 2 + a_lat ** 2)
-        return jnp.maximum(
-            jnp.maximum(0., jnp.abs(a_long) - _acc_max),
-            jnp.maximum(
-                jnp.maximum(0., jnp.abs(a_lat) - _acc_max),
-                jnp.maximum(0., am            - _acc_max),
-            ),
-        )
-
-    def jerk_g(theta, ctx):
-        """Jerk: max(|long|-LIM, |lat|-LIM, |total|-LIM, 0) per sample."""
-        st = _eval_vehicle_states(theta, ctx, gen)
         j_long, j_lat = st[:, 6], st[:, 7]
+        am = jnp.sqrt(a_long ** 2 + a_lat ** 2)
         jm = jnp.sqrt(j_long ** 2 + j_lat ** 2)
-        return jnp.maximum(
-            jnp.maximum(0., jnp.abs(j_long) - _jerk_max),
-            jnp.maximum(
-                jnp.maximum(0., jnp.abs(j_lat) - _jerk_max),
-                jnp.maximum(0., jm            - _jerk_max),
-            ),
+
+        g_speed = jnp.maximum(jnp.maximum(0., V_MIN - v), jnp.maximum(0., v - V_MAX))
+        g_acc = jnp.maximum(
+            jnp.maximum(0., jnp.abs(a_long) - _acc_max),
+            jnp.maximum(jnp.maximum(0., jnp.abs(a_lat) - _acc_max),
+                        jnp.maximum(0., am - _acc_max)),
         )
+        g_jerk = jnp.maximum(
+            jnp.maximum(0., jnp.abs(j_long) - _jerk_max),
+            jnp.maximum(jnp.maximum(0., jnp.abs(j_lat) - _jerk_max),
+                        jnp.maximum(0., jm - _jerk_max)),
+        )
+        return g_speed + g_acc + g_jerk  # element-wise sum → [T]
 
     return [
-        # P1 (最内层): 避障 — baseline=2.0, 安全底线, max 感应单点穿透
-        Deterministic(obs_g,   mode='hard', priority=1, aggregate='max',
-                      transform='hard'),
-        # P2-P5: comfort — mode='soft' → baseline=0
-        # 无违规时 Φ=0, σ层透明, obj信号完全恢复
-        Deterministic(lane_g,  mode='soft', priority=2, aggregate='q95',
-                      transform='soft'),
-        Deterministic(speed_g, mode='soft', priority=3, aggregate='max',
-                      transform='soft'),
-        Deterministic(acc_g,   mode='soft', priority=4, aggregate='max',
-                      transform='soft'),
-        Deterministic(jerk_g,  mode='soft', priority=5, aggregate='max',
-                      transform='soft'),
+        Deterministic(obs_g,        mode='hard', priority=1, aggregate='max',
+                       transform='hard'),
+        Deterministic(lane_g,       mode='soft', priority=2, aggregate='q95',
+                       transform='soft'),
+        Deterministic(kinematics_g, mode='soft', priority=3, aggregate='max',
+                       transform='soft'),
     ]
 
 
@@ -163,7 +148,9 @@ def make_constraints(gen, lane_hw: float, obs_safe_dist: float,
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad,
-                     lane_hw: float, obs_safe_dist: float):
+                     lane_hw: float, obs_safe_dist: float,
+                     d_min: float | None = None,
+                     d_max: float | None = None):
     """Compute per‑constraint g‑values for reporting.
 
     Args:
@@ -172,6 +159,8 @@ def compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad,
         x_cart, y_cart: [T] Cartesian positions
         obs_pos: [N, 2], obs_rad: [N]
         lane_hw, obs_safe_dist: scenario parameters
+        d_min:   lower lane boundary (None → -lane_hw)
+        d_max:   upper lane boundary (None → +lane_hw)
 
     Returns:
         dict with keys lane, obs, jerk, acc, speed (obs=max, rest=q90).
@@ -182,7 +171,14 @@ def compute_g_values(st, d, x_cart, y_cart, obs_pos, obs_rad,
     am = jnp.sqrt(a_long ** 2 + a_lat ** 2)
     jm = jnp.sqrt(j_long ** 2 + j_lat ** 2)
 
-    g_lane = jnp.quantile(jnp.maximum(0., jnp.abs(d) - lane_hw), 0.9)
+    _d_min = d_min if d_min is not None else -lane_hw
+    _d_max = d_max if d_max is not None else lane_hw
+
+    g_lane = jnp.quantile(
+        jnp.maximum(
+            jnp.maximum(0., _d_min - d),
+            jnp.maximum(0., d - _d_max),
+        ), 0.9)
 
     if obs_pos.shape[0] == 0:
         g_obs = 0.0
